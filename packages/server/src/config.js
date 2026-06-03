@@ -42,6 +42,7 @@ const config = {
 
   // ── WebSocket ──
   wsMaxPayload: 4 * 1024 * 1024, // 4MB
+  ipMaxPerConn: parseInt(process.env.WISON_IP_MAX_CONN || '3', 10), // v1.9: 每 IP 最大连接数
   heartbeatIntervalMs: 5000,
   heartbeatTimeoutMs: 15000,
 

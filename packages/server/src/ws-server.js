@@ -58,7 +58,7 @@ class WsServer {
     // IP 限流
     const ip = (info.req.socket.remoteAddress || 'unknown').replace(/^::ffff:/, '');
     const current = this._ipConnections.get(ip) || 0;
-    if (current >= 3) {
+    if (current >= config.ipMaxPerConn) {
       this._log.warn({ ip, current }, 'IP connection limit reached');
       cb(false, 429, 'Too Many Connections');
       return;

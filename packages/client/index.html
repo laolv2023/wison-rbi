@@ -3,6 +3,14 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Content-Security-Policy" content="
+  default-src 'self';
+  script-src 'self' 'unsafe-inline' https://unpkg.com;
+  connect-src 'self' ws: wss:;
+  img-src 'self' data: blob:;
+  style-src 'self' 'unsafe-inline';
+  frame-ancestors 'none';
+">
 <title>Wison-RBI</title>
 <style>
   :root {
@@ -56,6 +64,9 @@
 <script src="protocol/src/constants.js"></script>
 <script src="protocol/src/decoder.js"></script>
 <script src="protocol/src/validator.js"></script>
+<script src="https://unpkg.com/canvaskit-wasm@0.39.1/bin/canvaskit.js"
+        integrity="sha384-fI05zMq1iqtMKmiNT7JCzYOcSb4t+rq+qzNsqpWPoMVMa06n9sgUzrT9oxbFGm0m"
+        crossorigin="anonymous"></script>
 <script src="client/src/frame-buffer.js"></script>
 <script src="client/src/connection.js"></script>
 <script src="client/src/renderer.js"></script>

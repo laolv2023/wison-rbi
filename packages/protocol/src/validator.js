@@ -31,10 +31,10 @@ class CommandValidator {
       C.OpCode.CLIP_RECT, C.OpCode.CLIP_RRECT, C.OpCode.CLIP_PATH,
       // Shapes
       C.OpCode.DRAW_RECT, C.OpCode.DRAW_RRECT, C.OpCode.DRAW_OVAL,
-      C.OpCode.DRAW_ARC, C.OpCode.DRAW_PATH, C.OpCode.DRAW_POINTS,
+      C.OpCode.DRAW_ARC, C.OpCode.DRAW_PATH,
       C.OpCode.DRAW_SHADOW,
       // Images
-      C.OpCode.DRAW_IMAGE, C.OpCode.DRAW_IMAGE_RECT, C.OpCode.DRAW_ATLAS,
+      C.OpCode.DRAW_IMAGE, C.OpCode.DRAW_IMAGE_RECT,
       // Text
       C.OpCode.DRAW_TEXT_BLOB, C.OpCode.GLYPH_RUN_LIST,
       // Paint

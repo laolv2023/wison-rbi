@@ -102,7 +102,13 @@ function requestListener(req, res) {
     const contentType = mimeTypes[ext] || 'application/octet-stream';
     try {
       const content = fs.readFileSync(fullPath);
-      res.writeHead(200, { 'Content-Type': contentType, 'Content-Length': content.length });
+      const headers = {
+        'Content-Type': contentType,
+        'Content-Length': content.length,
+        'X-Content-Type-Options': 'nosniff',
+        'Cache-Control': ext === '.html' ? 'no-cache' : `max-age=${ext === '.wasm' ? 86400 : 3600}`,
+      };
+      res.writeHead(200, headers);
       res.end(content);
       return;
     } catch (_) { /* fall through to 404 */ }
@@ -130,11 +136,11 @@ async function gracefulShutdown(signal) {
     logger.info('Server closed');
     process.exit(0);
   });
-  // 强制退出 (5s 后)
+  // 强制退出 (15s 后 — v1.9: 5s→15s 给多 session 充足清理时间)
   setTimeout(() => {
     logger.error('Forced shutdown after timeout');
     process.exit(1);
-  }, 5000).unref();
+  }, 15000).unref();
 }
 
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));

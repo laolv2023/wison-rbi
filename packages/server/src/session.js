@@ -117,6 +117,10 @@ class Session {
     } catch (err) {
       this._log.error({ err }, 'Session start failed');
       this._started = false;
+      // v1.9: 部分初始化失败的资源清理
+      if (this._browser) { await this._browser.close().catch(() => {}); this._browser = null; }
+      this._page = null;
+      this._cdp = null;
       throw err;
     }
   }

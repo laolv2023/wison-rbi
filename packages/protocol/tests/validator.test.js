@@ -118,14 +118,11 @@ describe('CommandValidator', () => {
     assert.match(result.reason, /glyphCount/);
   });
 
-  it('rejects drawAtlas with excessive count', () => {
-    const payload = new Uint8Array(12);
-    const dv = new DataView(payload.buffer);
-    dv.setUint32(0, 200000, true);       // count > MAX_PATH_VERBS
-    const buf = cmd(C.OpCode.DRAW_ATLAS, payload);
+  it('rejects drawAtlas as unlisted opcode (v1.9)', () => {
+    const buf = cmd(C.OpCode.DRAW_ATLAS, new Uint8Array(4));
     const result = validator.scan(buf);
     assert.ok(!result.valid);
-    assert.match(result.reason, /count/);
+    assert.match(result.reason, /Invalid opcode/);
   });
 
   // ── 6. Frame-level byte limit (v1.6) ──
