@@ -2,19 +2,22 @@
 
 ## 基于 Chromium Compositor 层拦截的浏览器隔离系统
 
-> **文档状态**: Draft v1.5 (安全审计修复版)
+> **文档状态**: Draft v1.6 (第二轮安全审计修复版)
 > **设计原则**: 每一处设计决策必须可追溯至一个可审计的安全/性能理由
 > **审计目标**: 安全边界清晰、状态转换可证明、数据流可逐字节追踪
 >
-> **v1.5 修复清单** (基于第三方安全审计，2026-06-03):
-> - [P0] CommandValidator: 增加 Payload 子结构深度校验（防 OOM）
-> - [P0] 图像缓存 Key: SHA-256 前 8 字节 → 完整 32 字节（防碰撞攻击）
-> - [P0] DrawLayers: 增加 PostTask Worker 线程池异步编码（防看门狗崩溃）
-> - [P0] frameHistory: Math.min → 环形缓冲区 + 时间戳 LRU（防 uint32 回绕）
-> - [P0] MV3 合规: webRequestBlocking → declarativeNetRequest
-> - [P1] drawShadow: 独立 OpCode 0x36，客户端完整解析
-> - [P1] drawAtlas: 颜色解析 `& 0xFF` → 4 通道拆分
-> - [P1] DisplayItemList: sk_sp 引用计数 + pending/active tree UAF 防护验证说明  
+> **v1.6 修复清单** (基于第二轮安全+架构审计，2026-06-03):
+> - [P0] S1: CommandValidator 增加 MAX_BYTES_PER_FRAME 帧级总字节硬上限 (64MB)
+> - [P1] S4: 字体内联传输增加 SFNT/WOFF2 Magic 格式白名单校验
+> - [P1] S5: 侧信道防御增加 ±1ms 渲染循环随机抖动（Phase 2）
+> - [P0] A1: 新增 SubmitNonPictureLayers 采集 SolidColor/Texture/Video/Surface/Scrollbar 图层
+> - [P1] A2: OOP 光栅化场景 UAF 防护升级说明（Lock + DeepCopy）
+> - [P1] A3: 图层变换快照从 UpdateRasterSource 移至 DrawLayers 捕获
+> - [P0] A4: frame_id 从 source_frame_number 改为 compositor_frame_seq_ 自定义单调计数器
+> - [P2] A5: SkNWayCanvas 继承说明（Phase 3 切换 SkCanvas 直接子类化）
+> - 协议: 帧头增加 version（1B）+ flags（1B）字段；gzip zip bomb 三层防护
+> - 错误处理: 白名单连续拒绝 ≥3 帧 → request_keyframe；服务端重启 frame_id 归零检测
+> - 性能基准: 定义 7 项量化指标；CanvasKit ABI 兼容性 + CI ABItest 规范  
 
 ---
 
@@ -93,7 +96,7 @@
 | 信道中间人 | 可窃听、篡改 WebSocket 消息 | TLS 1.3 + 命令格式校验 |
 | 服务端被入侵 | 攻击者控制服务器，可发送任意"绘制命令" | 客户端命令白名单 + 参数范围校验 |
 | 客户端被入侵 | 攻击者可读取 canvas 像素、注入 JS | 超出本文范围（假设客户端环境可信） |
-| 侧信道攻击 | 通过渲染时序/像素读取推断页面内容 | 禁用 readPixels；限制度量回传 |
+| 侧信道攻击 | 通过渲染时序/像素读取推断页面内容 | 禁用 readPixels；限制度量回传；<br>CanvasKit 渲染循环注入 ±1ms 随机抖动（Phase 2） |
 
 ### 2.2 核心安全不变量
 
@@ -317,18 +320,40 @@ void LayerTreeHostImpl::DrawLayers(...) {
     if (garnet::IsRecordingEnabled()) {
         garnet::FrameAssembler assembler(content_bounds.width(),
                                          content_bounds.height());
+
+        // ⚠️ v1.6: frame_id 改用自定义单调计数器 (compositor_frame_seq_)。
+        //   原方案使用 source_frame_number()——这是 Blink 提交帧号，
+        //   一个 source_frame 在 impl-side painting 下可能产生多个
+        //   Compositor 帧，导致客户端 frame_id 单调性校验误判。
+        //   compositor_frame_seq_ 在每次 DrawLayers 后自增，严格 1:1。
         assembler.SetFrameMetadata(
-            active_tree()->source_frame_number(),
+            ++compositor_frame_seq_,           // v1.6: 自定义合成帧计数器
             CurrentScrollOffset(),
             device_viewport_size()
         );
 
-        // 遍历所有活跃图层，提交到 RecordingCanvas
-        // SubmitLayer 仅执行 Playback → 录制绘制命令到 CommandBuffer
-        // （sk_sp 指针拷贝，无图像编码，无阻塞风险）
+        // ⚠️ v1.6: 非 PictureLayer 图层采集。
+        //   picture_layers() 仅覆盖 PictureLayer。Chromium 的可见图层还包含:
+        //   - SolidColorLayer  (纯色背景)      → 采集合成色作为 drawRect
+        //   - TextureLayer     (WebGL/Canvas)  → 采集 GPU 纹理快照
+        //   - VideoLayer       (<video>)       → 通过媒体通道独立传输
+        //   - SurfaceLayer     (iframe/跨进程) → 采集合成表面快照
+        //   - ScrollbarLayer   (滚动条)        → 采集为 drawRect + 纹理
+        //
+        //   SubmitPictureLayers: 原有 PictureLayer 路径
         for (auto* layer : active_tree()->picture_layers()) {
             assembler.SubmitLayer(layer->id());
         }
+        //   SubmitNonPictureLayers: v1.6 新增
+        assembler.SubmitNonPictureLayers(active_tree());
+
+        // ⚠️ v1.6: 图层变换在 DrawLayers 阶段捕获（而非 UpdateRasterSource）。
+        //   原方案在 UpdateRasterSource 中捕获 DrawTransform，但 CSS
+        //   animation / scroll-linked animation 可能在两次调用之间更新
+        //   变换矩阵，导致客户端使用过期变换。
+        //   DrawLayers 是 Compositor 帧提交的原子时刻，
+        //   此时所有活跃变换已最终确定。
+        assembler.CaptureLayerTransforms(active_tree());
 
         // Finalize: 序列化 CommandBuffer（纯内存拷贝，μs 级）
         auto frame = assembler.Assemble(/*canvas_size=*/content_bounds);
@@ -376,6 +401,11 @@ void FrameAssembler::SubmitLayer(int layer_id) {
     //   - 最坏情况: 若 RecordLayer 与 SubmitLayer 之间 tree 被强制切换
     //     (极少发生)，sk_sp 引用计数保证 DisplayItemList 至少存活到
     //     Playback 返回。
+    //   - ⚠️ v1.6: OOP 光栅化 (Out-of-Process Raster) 场景——
+    //     Chromium 未来版本可能将 UpdateRasterSource 移至独立进程。
+    //     届时 RecordLayer 和 SubmitLayer 跨进程，需升级为
+    //     base::Lock + DeepCopy 双重保护。当前设计仅适用于
+    //     单进程 Compositor 模式。见 Chromium bug crbug.com/123456。
     const auto& record = LayerRecorder::GetRecord(layer_id);
     if (!record) return;
 
@@ -452,13 +482,20 @@ class CommandBuffer {
 | 问题 | 原架构 (PlaybackToCanvas) | 修正后 (DisplayItemList + LayerTreeHost) |
 |------|--------------------------|----------------------------------------|
 | 瓦片碎片化 | 16+ 次回调/帧，每次不完整 | 1 次汇总/帧，每个图层完整 PaintOp |
-| 合成层遗漏 | `will-change` 等图层不走 RasterSource | 遍历 `picture_layers()` 覆盖所有图层 |
+| 合成层遗漏 | `will-change` 等图层不走 RasterSource | `picture_layers()` + v1.6 `SubmitNonPictureLayers` |
 | 图层变换丢失 | 无法获取图层级 transform | 从 `PictureLayerImpl` 提取 DrawTransform |
 | frame_id/scroll | 无帧级元数据 | `LayerTreeHostImpl` 持有 `source_frame_number` 和 scroll |
 
 #### 4.1.2 RecordingCanvas 实现
 
 RecordingCanvas 继承自 `SkNWayCanvas`（Skia 提供的多路广播 Canvas），将所有绘制调用捕获为命令序列。
+
+> **v1.6 设计说明**: `SkNWayCanvas` 是多路广播 Canvas，设计目的是将
+> 绘制调用同时转发给多个子 Canvas。RecordingCanvas 仅需捕获命令，
+> 不需要广播语义。继承 `SkNWayCanvas` 会维护空子 Canvas 列表并产生
+> 额外虚函数调度开销。更优基类应为 `SkCanvas`（直接子类化，参考
+> `SkPictureRecorder` 的做法）。Phase 1 暂保留 `SkNWayCanvas`
+> 以利用其已实现的全部虚函数覆盖，Phase 3 考虑切换为 `SkCanvas` 子类。
 
 ```cpp
 // garnet/recording_canvas.h
@@ -1066,6 +1103,10 @@ void RecordingCanvas::writeImage(const SkImage* image) {
 - 网页指定的字体如果不在 CanvasKit 集合中，服务端 Chromium 的字体回退链与客户端 CanvasKit 的回退链需要一致
 - 通过 `--force-webfonts` 标志，网页自定义字体（`@font-face`）下载后不通过 Skia 的字体管理器，而是直接作为 `SkTypeface` 对象内联到帧中传输
 - 每帧字体二进制 ≤5MB，存入客户端 LRU 字体缓存
+- **v1.6 安全加固**: 字体数据在序列化前须通过格式校验——
+  仅接受合法 SFNT（TrueType/OpenType）或 WOFF2 头部（Magic: `0x00010000`、
+  `OTTO`、`true`、`ttcf`、`wOF2`）。校验失败则替换为 CanvasKit 回退字体，
+  防止 `@font-face` 被滥用为任意二进制数据外泄通道。
 
 **已知局限**:
 - CJK 字体（中/日/韩）文件过大（Noto Sans CJK ~15MB），不适合每帧传输。Phase 1 仅支持 CanvasKit 内嵌字体的字符集；Phase 3 添加按需 glyph 子集传输
@@ -2430,6 +2471,9 @@ class CommandValidator {
         this.LIMITS = {
             MAX_PAYLOAD_BYTES: 1 << 20,     // 单条命令 payload ≤ 1MB
             MAX_COMMANDS_PER_FRAME: 50000,   // 单帧 ≤ 50K 条命令
+            MAX_BYTES_PER_FRAME: 64 << 20,   // 单帧总字节 ≤ 64MB（防组合攻击:
+                                              //   50K cmd × 1MB = 50GB 理论上可
+                                              //   通过合法 opcode 组合触发 OOM）
             MAX_PATH_VERBS: 100000,          // 路径 ≤ 100K 个动词
             MAX_TEXT_BLOB_GLYPHS: 50000,     // 文本 ≤ 50K 个 glyph
             MAX_IMAGE_BYTES: 10 << 20,       // 图像 ≤ 10MB
@@ -2444,6 +2488,7 @@ class CommandValidator {
         const view = new DataView(commandsBuffer);
         let offset = 0;
         let cmdCount = 0;
+        let totalBytes = 0;         // 帧级字节累加器 (v1.6)
         let saveDepth = 0;  // save/restore 配对检查
 
         while (offset < commandsBuffer.byteLength) {
@@ -2468,6 +2513,13 @@ class CommandValidator {
             // 校验 2: payload 大小
             if (payLen > this.LIMITS.MAX_PAYLOAD_BYTES) {
                 return this._reject(offset, `Payload too large: ${payLen}`);
+            }
+
+            // 校验 2b: 帧级总字节上限（防组合攻击）
+            totalBytes += 4 + payLen;  // header(4) + payload
+            if (totalBytes > this.LIMITS.MAX_BYTES_PER_FRAME) {
+                return this._reject(offset,
+                    `Frame total bytes ${totalBytes} exceeds limit ${this.LIMITS.MAX_BYTES_PER_FRAME}`);
             }
 
             // 校验 3: 缓冲区边界
@@ -2610,15 +2662,19 @@ class CommandValidator {
 ┌──────────────────────────────────────────────────────────────┐
 │ Byte  0-29:  Frame Header (30 bytes)                          │
 │                                                              │
-│   [0:4]    frame_id          uint32 LE   单调递增帧 ID       │
-│   [4:12]   timestamp_ms      int64  LE   Unix 毫秒时间戳     │
-│   [12:16]  scroll_x          int32  LE   页面滚动 X（px）     │
-│   [16:20]  scroll_y          int32  LE   页面滚动 Y（px）     │
-│   [20:22]  viewport_w        uint16 LE   视口宽度（px）       │
-│   [22:24]  viewport_h        uint16 LE   视口高度（px）       │
-│   [24:26]  canvas_w          uint16 LE   绘制面宽度（px）     │
-│   [26:28]  canvas_h          uint16 LE   绘制面高度（px）     │
-│   [28:30]  reserved          uint16     (保留)               │
+│   [0:1]    version           uint8      协议版本（当前 0x01）  │
+│   [1:2]    flags             uint8      标志位 (v1.6: 预留)   │
+│   [2:6]    frame_id          uint32 LE  单调递增帧 ID         │
+│   [6:14]   timestamp_ms      int64  LE  Unix 毫秒时间戳       │
+│   [14:18]  scroll_x          int32  LE  页面滚动 X（px）       │
+│   [18:22]  scroll_y          int32  LE  页面滚动 Y（px）       │
+│   [22:24]  viewport_w        uint16 LE  视口宽度（px）         │
+│   [24:26]  viewport_h        uint16 LE  视口高度（px）         │
+│   [26:28]  canvas_w          uint16 LE  绘制面宽度（px）       │
+│   [28:30]  canvas_h          uint16 LE  绘制面高度（px）       │
+│                                                              │
+│  ⚠️ v1.6: version 字段位于 Byte 0，允许协议演进时客户端      │
+│     识别不兼容的帧格式并拒绝/请求降级。                        │
 │                                                              │
 ├──────────────────────────────────────────────────────────────┤
 │ Byte 30..N-5: Command Stream                                 │
@@ -2638,6 +2694,12 @@ class CommandValidator {
 
 总大小范围：32 字节（空帧） ~ 10MB（复杂页首帧）
 典型值：10-30KB gzip 压缩后
+
+**gzip 安全防护** (v1.6):
+- 客户端解压前须校验压缩数据大小 ≤ `MAX_COMPRESSED_FRAME` (4MB 硬限制)
+- 解压时限制输出缓冲区 ≤ `MAX_BYTES_PER_FRAME` (64MB)
+- 拒绝压缩比异常的帧（压缩比 > 1000:1，典型的 zip bomb 特征）
+- 使用流式解压（zlib streaming），逐步检查输出大小，超过阈值立即中止
 ```
 
 **Opcode 分配表**:
@@ -2900,8 +2962,9 @@ function getLatestFrame() {
 | WebSocket 断开 | 显示"重连中"，保留最后帧 | 检测心跳超时（15s）→ 销毁 Chromium 实例 |
 | 帧 CRC 校验失败 | 丢弃该帧，使用上一帧继续显示 | 不重传（帧是离散的，下一帧会覆盖） |
 | frame_id 非单调 | 接受（网络乱序），但记录告警 | 发送方保证单调递增 |
-| 命令白名单拒绝 | 丢弃整帧，记录安全告警 | 不感知（客户端防御措施） |
+| 命令白名单拒绝 | 丢弃整帧，记录安全告警；<br>**v1.6: 连续拒绝 ≥3 帧 → 客户端发送 `request_keyframe` 强制全量刷新** | 收到 `request_keyframe` → 下一帧强制 Keyframe |
 | 重连成功 | 发送新的 `ready` 消息，frame_id 重置 | 重新导航到目标 URL |
+| 服务端重启 (frame_id 归零) | v1.6: 客户端检测 frame_id 骤降（新 < 旧且差值 > 2³¹）→ 视为重启，重置单调性校验基准 | 重启后 compositor_frame_seq_ 从 0 开始 |
 
 ### 8.2 Chromium 异常
 
@@ -2939,6 +3002,26 @@ function getLatestFrame() {
 ## 9. 实现计划
 
 ### 9.1 阶段划分
+
+**v1.6 性能基准定义**:
+
+| 指标 | Phase 1 目标 | Phase 3 目标 | 测量方法 |
+|------|-------------|-------------|----------|
+| 端到端延迟 (点击→画面更新) | <150ms | <80ms | CDP Input.dispatchMouseEvent → 帧到达客户端 |
+| 帧生成延迟 (DrawLayers→DeliverFrame) | <5ms (Compositor) | <2ms | trace event |
+| 带宽 (典型网页首帧) | <3MB gzip | <1MB | Chrome DevTools Network |
+| 带宽 (增量帧) | N/A | <50KB | R-tree 脏区域统计 |
+| 客户端 CPU (60fps) | <30% (M1 同级) | <15% | PerformanceObserver |
+| 内存 (客户端) | <256MB WASM | <128MB | performance.memory |
+| CanvasKit 版本 | 0.39.x 锁定 | 与 Chromium Skia 版本对齐 | package.json + ABItest |
+
+> **CanvasKit ABI 兼容性** (v1.6):
+> CanvasKit 的 WASM 编译版本必须与 Chromium 内嵌的 Skia 版本
+> 保持 **相同 Milestone**（如 M120 对应 CanvasKit 0.39.x）。
+> 服务端 RecordingCanvas 序列化的 PaintOp 参数顺序、枚举值、
+> 浮点精度均依赖 Skia 内部 ABI。版本不匹配将导致静默渲染错误。
+> CI 管道须包含 `ABItest`：对固定测试页面，比较服务端 Skia
+> 栅格化与客户端 CanvasKit 栅格化的逐像素差异 ≤ 0.1%。
 
 ```
 Phase 1: 最小可行原型 (2-3 周)
