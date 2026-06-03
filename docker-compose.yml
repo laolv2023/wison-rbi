@@ -1,0 +1,33 @@
+# PaintOp Remote Browser — 最小测试部署
+#
+# 一键启动:
+#   docker compose up
+#
+# 然后打开: http://容器IP:8080
+
+version: "3.9"
+
+services:
+  paintop:
+    build: .
+    container_name: paintop-test
+    ports:
+      - "8080:8080"
+    environment:
+      - PYTHONUNBUFFERED=1
+    # 共享内存对 Chromium 至关重要
+    shm_size: "2gb"
+    # 安全隔离 (仅在需要时放宽)
+    security_opt:
+      - seccomp:unconfined
+    # 资源限制 (测试用)
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"

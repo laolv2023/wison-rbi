@@ -1,0 +1,762 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PaintOp Remote Browser</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --border: #30363d;
+    --accent: #58a6ff;
+    --accent2: #3fb950;
+    --text: #e6edf3;
+    --text-dim: #8b949e;
+    --red: #f85149;
+    --yellow: #d2991d;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans SC", sans-serif;
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  /* ═══════════════════════════════════════════
+     PORTAL MODE — 网站选择器
+     ═══════════════════════════════════════════ */
+  #portal {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    padding: 40px 20px;
+    transition: opacity .3s, transform .3s;
+  }
+  #portal.hidden {
+    opacity: 0;
+    transform: translateY(-20px);
+    pointer-events: none;
+    position: absolute;
+    inset: 0;
+  }
+
+  #portal .logo {
+    font-size: 32px;
+    font-weight: 700;
+    margin-bottom: 8px;
+    letter-spacing: -0.5px;
+  }
+  #portal .logo span { color: var(--accent); }
+  #portal .subtitle {
+    color: var(--text-dim);
+    font-size: 15px;
+    margin-bottom: 40px;
+  }
+
+  /* URL input area */
+  .url-bar-wrap {
+    width: 100%;
+    max-width: 680px;
+    display: flex;
+    gap: 10px;
+    margin-bottom: 48px;
+  }
+  #portal-url {
+    flex: 1;
+    height: 48px;
+    padding: 0 18px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--bg);
+    color: var(--text);
+    font-size: 15px;
+    outline: none;
+    transition: border-color .2s, box-shadow .2s;
+  }
+  #portal-url:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(88,166,255,0.15);
+  }
+  #portal-url::placeholder { color: var(--text-dim); }
+  #btn-launch {
+    height: 48px;
+    padding: 0 28px;
+    border: none;
+    border-radius: 10px;
+    background: var(--accent2);
+    color: #fff;
+    font-size: 15px;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background .2s, transform .1s;
+  }
+  #btn-launch:hover { background: #2ea043; }
+  #btn-launch:active { transform: scale(0.97); }
+
+  /* Site grid */
+  .site-grid {
+    width: 100%;
+    max-width: 800px;
+  }
+  .site-grid .category {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 12px;
+    margin-top: 28px;
+  }
+  .site-grid .category:first-of-type { margin-top: 0; }
+  .site-grid .tiles {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
+    gap: 10px;
+  }
+  .site-tile {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 14px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--surface);
+    cursor: pointer;
+    transition: border-color .2s, background .2s;
+    font-size: 14px;
+  }
+  .site-tile:hover {
+    border-color: var(--accent);
+    background: #1c2333;
+  }
+  .site-tile .favicon {
+    width: 20px; height: 20px;
+    border-radius: 4px;
+    flex-shrink: 0;
+    background: var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
+    overflow: hidden;
+  }
+  .site-tile .favicon img { width: 16px; height: 16px; }
+  .site-tile .label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .site-tile .hint { font-size: 11px; color: var(--text-dim); }
+
+  /* ═══════════════════════════════════════════
+     BROWSER MODE — 远程浏览器界面
+     ═══════════════════════════════════════════ */
+  #browser {
+    display: none;
+    flex-direction: column;
+    height: 100vh;
+    opacity: 0;
+    transition: opacity .3s;
+  }
+  #browser.active { display: flex; opacity: 1; }
+
+  #toolbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+  #toolbar button {
+    width: 32px; height: 32px;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--text);
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 15px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: background .15s;
+    flex-shrink: 0;
+  }
+  #toolbar button:hover { background: var(--border); }
+  #toolbar button:active { background: var(--accent); }
+  #btn-home {
+    font-weight: 700;
+    color: var(--accent) !important;
+    border-color: var(--accent) !important;
+  }
+  #browser-url {
+    flex: 1;
+    height: 32px;
+    min-width: 0;
+    padding: 0 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg);
+    color: var(--text);
+    font-size: 13px;
+    outline: none;
+  }
+  #browser-url:focus { border-color: var(--accent); }
+
+  #canvas-wrap {
+    flex: 1;
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #000;
+    overflow: hidden;
+  }
+  #remote-canvas {
+    display: block;
+    image-rendering: auto;
+    cursor: crosshair;
+  }
+
+  /* Loading overlay inside canvas */
+  #loading-overlay {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0,0,0,0.75);
+    transition: opacity .4s;
+    pointer-events: none;
+  }
+  #loading-overlay.hidden { opacity: 0; }
+  .spinner {
+    width: 36px; height: 36px;
+    border: 3px solid var(--border);
+    border-top: 3px solid var(--accent);
+    border-radius: 50%;
+    animation: spin .8s linear infinite;
+    margin-bottom: 10px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #loading-text { font-size: 13px; color: var(--text-dim); }
+
+  /* Status bar */
+  #statusbar {
+    display: flex;
+    align-items: center;
+    gap: 18px;
+    padding: 5px 14px;
+    background: var(--surface);
+    border-top: 1px solid var(--border);
+    font-size: 12px;
+    color: var(--text-dim);
+    flex-shrink: 0;
+  }
+  .status-dot {
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    display: inline-block;
+    margin-right: 5px;
+  }
+  .status-dot.online { background: var(--accent2); }
+  .status-dot.offline { background: var(--red); }
+  .status-dot.loading { background: var(--yellow); animation: pulse .6s infinite; }
+  @keyframes pulse { 50% { opacity: 0.4; } }
+  #page-title {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text);
+  }
+
+  /* Error banner */
+  #error-banner {
+    display: none;
+    background: var(--red);
+    color: #fff;
+    padding: 8px 14px;
+    font-size: 13px;
+    text-align: center;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  #error-banner.show { display: block; }
+</style>
+</head>
+<body>
+
+<!-- ═══════════════════════════════════════════
+     PORTAL — 网站选择器
+     ═══════════════════════════════════════════ -->
+<div id="portal">
+  <div class="logo">PaintOp <span>Remote</span> Browser</div>
+  <div class="subtitle">选择一个网站，在远端 Chromium 中安全浏览</div>
+
+  <div class="url-bar-wrap">
+    <input id="portal-url" type="text"
+           placeholder="输入网址，如 https://github.com"
+           autofocus
+           autocomplete="off"
+           spellcheck="false">
+    <button id="btn-launch" onclick="launchSession()">启动</button>
+  </div>
+
+  <div class="site-grid">
+    <div class="category">常用网站</div>
+    <div class="tiles" id="tiles-common"></div>
+
+    <div class="category">技术开发</div>
+    <div class="tiles" id="tiles-tech"></div>
+
+    <div class="category">信息查询</div>
+    <div class="tiles" id="tiles-info"></div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════
+     BROWSER — 远程浏览器界面
+     ═══════════════════════════════════════════ -->
+<div id="browser">
+  <div id="error-banner" onclick="reconnect()">⚠️ 连接已断开，点击重试</div>
+
+  <div id="toolbar">
+    <button id="btn-home" title="返回首页" onclick="goHome()">⌂</button>
+    <button title="后退" onclick="sendControl('navigate', {action:'back'})">◀</button>
+    <button title="前进" onclick="sendControl('navigate', {action:'forward'})">▶</button>
+    <button title="刷新" onclick="sendControl('navigate', {action:'reload'})">↻</button>
+    <input id="browser-url" type="text" placeholder="输入网址" autocomplete="off" spellcheck="false">
+    <button title="前往" onclick="navigate()" style="font-weight:700">→</button>
+  </div>
+
+  <div id="canvas-wrap">
+    <canvas id="remote-canvas"></canvas>
+    <div id="loading-overlay">
+      <div class="spinner"></div>
+      <div id="loading-text">正在连接...</div>
+    </div>
+  </div>
+
+  <div id="statusbar">
+    <span><span id="status-dot" class="status-dot offline"></span><span id="status-text">等待启动</span></span>
+    <span id="page-title">—</span>
+    <span>FPS: <strong id="fps-display">—</strong></span>
+    <span>BW: <strong id="bw-display">—</strong> KB/s</span>
+    <span id="frame-type"></span>
+    <span id="latency"></span>
+  </div>
+</div>
+
+<script>
+// ═══════════════════════════════════════════
+//  PaintOp Client — Protocol + UI
+// ═══════════════════════════════════════════
+
+const MAGIC = new Uint8Array([0x50, 0x53]);
+const FRAME_TYPE_LABEL = { 0x01: 'KEYFRAME', 0x02: 'DIFF' };
+
+const HID = {
+  MOUSE_MOVE: 0x10, MOUSE_DOWN: 0x11, MOUSE_UP: 0x12,
+  MOUSE_WHEEL: 0x13, KEY_DOWN: 0x14, KEY_UP: 0x15,
+};
+
+// ── DOM refs ──────────────────────────────
+const $portal    = document.getElementById('portal');
+const $portalUrl = document.getElementById('portal-url');
+const $browser   = document.getElementById('browser');
+const $canvas    = document.getElementById('remote-canvas');
+const ctx        = $canvas.getContext('2d', { willReadFrequently: false });
+const $browserUrl= document.getElementById('browser-url');
+const $loading   = document.getElementById('loading-overlay');
+const $loadText  = document.getElementById('loading-text');
+const $statusDot = document.getElementById('status-dot');
+const $statusTxt = document.getElementById('status-text');
+const $pageTitle = document.getElementById('page-title');
+const $fps       = document.getElementById('fps-display');
+const $bw        = document.getElementById('bw-display');
+const $frameType = document.getElementById('frame-type');
+const $latency   = document.getElementById('latency');
+const $errBanner = document.getElementById('error-banner');
+
+// ── State ─────────────────────────────────
+let ws = null;
+let connected = false;
+let viewport = { w: 1280, h: 720 };
+let frameN = 0, bytesRx = 0, fpsN = 0;
+let statsTs = 0;
+let sessionUrl = '';
+
+// ═══════════════════════════════════════════
+//  SITE TILES — 快捷入口
+// ═══════════════════════════════════════════
+const SITES = {
+  common: [
+    { label: 'Google',      url: 'https://www.google.com',        icon: 'G',  hint: '搜索引擎' },
+    { label: 'GitHub',      url: 'https://github.com',            icon: 'GH', hint: '代码托管' },
+    { label: 'Wikipedia',   url: 'https://www.wikipedia.org',     icon: 'W',  hint: '百科全书' },
+    { label: 'Bilibili',    url: 'https://www.bilibili.com',      icon: 'B',  hint: '视频社区' },
+    { label: '百度',        url: 'https://www.baidu.com',         icon: '百', hint: '中文搜索' },
+    { label: '知乎',        url: 'https://www.zhihu.com',         icon: '知', hint: '问答社区' },
+  ],
+  tech: [
+    { label: 'MDN',         url: 'https://developer.mozilla.org', icon: 'M',  hint: 'Web 文档' },
+    { label: 'StackOverflow',url:'https://stackoverflow.com',     icon: 'SO', hint: '技术问答' },
+    { label: 'npm',         url: 'https://www.npmjs.com',         icon: 'N',  hint: '包管理' },
+    { label: 'Docker Hub',  url: 'https://hub.docker.com',        icon: 'D',  hint: '容器镜像' },
+    { label: 'PyPI',        url: 'https://pypi.org',              icon: 'Py', hint: 'Python 包' },
+    { label: 'Rust Docs',   url: 'https://docs.rs',               icon: 'Rs', hint: 'Rust 文档' },
+  ],
+  info: [
+    { label: 'httpbin',     url: 'https://httpbin.org',           icon: 'H',  hint: 'HTTP 测试' },
+    { label: 'Hacker News', url: 'https://news.ycombinator.com',  icon: 'HN', hint: '科技新闻' },
+    { label: 'Arch Wiki',   url: 'https://wiki.archlinux.org',    icon: 'A',  hint: 'Linux 百科' },
+    { label: 'caniuse',     url: 'https://caniuse.com',           icon: 'C',  hint: '浏览器兼容' },
+    { label: 'Speedtest',   url: 'https://www.speedtest.net',     icon: 'S',  hint: '网速测试' },
+    { label: 'JSON Placeholder', url:'https://jsonplaceholder.typicode.com', icon:'J', hint:'Mock API'},
+  ],
+};
+
+function renderTiles() {
+  for (const [cat, sites] of Object.entries(SITES)) {
+    const container = document.getElementById('tiles-' + cat);
+    if (!container) continue;
+    container.innerHTML = sites.map(s =>
+      `<div class="site-tile" data-url="${s.url}" onclick="pickSite('${s.url}')" title="${s.hint || ''}">
+        <span class="favicon">${s.icon}</span>
+        <span class="label">${s.label}</span>
+      </div>`
+    ).join('');
+  }
+}
+renderTiles();
+
+function pickSite(url) {
+  $portalUrl.value = url;
+  launchSession();
+}
+
+// Portal URL bar: Enter key
+$portalUrl.addEventListener('keydown', e => {
+  if (e.key === 'Enter') launchSession();
+});
+
+// ═══════════════════════════════════════════
+//  SESSION LIFECYCLE
+// ═══════════════════════════════════════════
+
+function launchSession() {
+  let raw = $portalUrl.value.trim();
+  if (!raw) return;
+  if (!/^https?:\/\//i.test(raw)) raw = 'https://' + raw;
+  sessionUrl = raw;
+
+  // Transition to browser mode
+  $portal.classList.add('hidden');
+  $browser.classList.add('active');
+  $browserUrl.value = sessionUrl;
+  $loadText.textContent = '正在连接服务端...';
+  $loading.classList.remove('hidden');
+  setStatus('loading', '连接中...');
+  fitCanvas();
+
+  // Connect WebSocket
+  connectWS();
+}
+
+function goHome() {
+  disconnectWS();
+  $browser.classList.remove('active');
+  $portal.classList.remove('hidden');
+  $portalUrl.value = '';
+  $portalUrl.focus();
+  setStatus('offline', '等待启动');
+  $pageTitle.textContent = '—';
+  $fps.textContent = '—';
+  $bw.textContent = '—';
+  $frameType.textContent = '';
+  $latency.textContent = '';
+}
+
+// ═══════════════════════════════════════════
+//  WEBSOCKET
+// ═══════════════════════════════════════════
+
+function connectWS() {
+  $errBanner.classList.remove('show');
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const wsUrl = `${proto}//${location.host}/ws`;
+
+  ws = new WebSocket(wsUrl);
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = () => {
+    connected = true;
+    setStatus('loading', 'Chromium 启动中...');
+    $loadText.textContent = '正在启动远端浏览器...';
+    // 发送启动指令 (触发服务端 Chromium 启动)
+    sendControl('navigate', { url: sessionUrl });
+    sendControl('resize', { width: viewport.w, height: viewport.h });
+    statsTs = performance.now();
+    frameN = bytesRx = fpsN = 0;
+  };
+
+  ws.onmessage = ev => {
+    if (ev.data instanceof ArrayBuffer) {
+      handleFrame(new Uint8Array(ev.data));
+    } else if (typeof ev.data === 'string') {
+      handleText(ev.data);
+    }
+  };
+
+  ws.onclose = () => {
+    connected = false;
+    setStatus('offline', '已断开');
+    $errBanner.classList.add('show');
+  };
+
+  ws.onerror = () => {
+    connected = false;
+    setStatus('offline', '连接失败');
+    $errBanner.classList.add('show');
+  };
+}
+
+function disconnectWS() {
+  if (ws) {
+    ws.onclose = null; // 避免触发 reconnect 提示
+    ws.close();
+    ws = null;
+  }
+  connected = false;
+}
+
+function reconnect() {
+  disconnectWS();
+  connectWS();
+}
+
+// ═══════════════════════════════════════════
+//  FRAME DECODER
+// ═══════════════════════════════════════════
+
+function handleFrame(data) {
+  bytesRx += data.length;
+  frameN++;
+  fpsN++;
+
+  let off = 0;
+  if (data[off] !== MAGIC[0] || data[off + 1] !== MAGIC[1]) return;
+  off += 2;
+  off += 1; // version
+  const ftype = data[off++];
+  const tileCnt = (data[off] << 8) | data[off + 1];
+  off += 2;
+
+  const tiles = [];
+  for (let i = 0; i < tileCnt; i++) {
+    const x  = (data[off] << 8) | data[off + 1]; off += 2;
+    const y  = (data[off] << 8) | data[off + 1]; off += 2;
+    const w  = (data[off] << 8) | data[off + 1]; off += 2;
+    const h  = (data[off] << 8) | data[off + 1]; off += 2;
+    const enc= (data[off] << 8) | data[off + 1]; off += 2;
+    const len= (data[off] << 24) | (data[off+1] << 16) | (data[off+2] << 8) | data[off+3];
+    off += 4;
+    tiles.push({ x, y, w, h, enc, len, dOff: off });
+    off += len;
+  }
+
+  renderTiles(tiles, data, ftype);
+  $frameType.textContent = FRAME_TYPE_LABEL[ftype] || '';
+
+  if (frameN === 1) {
+    $loading.classList.add('hidden');
+    setStatus('online', '已连接');
+  }
+}
+
+function renderTiles(tiles, buf, ftype) {
+  const sx = $canvas.width / viewport.w;
+  const sy = $canvas.height / viewport.h;
+
+  // Keyframe with single full-viewport tile → efficient path
+  if (ftype === 0x01 && tiles.length === 1 && tiles[0].w === viewport.w) {
+    const t = tiles[0];
+    const blob = new Blob([buf.slice(t.dOff, t.dOff + t.len)], { type: 'image/jpeg' });
+    const img = new Image();
+    img.onload = () => { ctx.clearRect(0, 0, $canvas.width, $canvas.height); ctx.drawImage(img, 0, 0, $canvas.width, $canvas.height); };
+    img.src = URL.createObjectURL(blob);
+    return;
+  }
+
+  for (const t of tiles) {
+    const mime = t.enc === 0x01 ? 'image/jpeg' : 'image/png';
+    const blob = new Blob([buf.slice(t.dOff, t.dOff + t.len)], { type: mime });
+    const img = new Image();
+    img.onload = () => ctx.drawImage(img, t.x * sx, t.y * sy, t.w * sx, t.h * sy);
+    img.src = URL.createObjectURL(blob);
+  }
+}
+
+// ═══════════════════════════════════════════
+//  TEXT & CONTROL MESSAGES
+// ═══════════════════════════════════════════
+
+function handleText(raw) {
+  try {
+    const m = JSON.parse(raw);
+    if (m.type === 'status') {
+      $browserUrl.value = m.url || '';
+      $pageTitle.textContent = m.title || m.url || '—';
+      if (m.loading) {
+        setStatus('loading', '加载中...');
+      } else {
+        setStatus('online', '已连接');
+        $loading.classList.add('hidden');
+      }
+    }
+  } catch (_) {}
+}
+
+function sendControl(type, extra = {}) {
+  if (!connected || !ws) return;
+  ws.send(JSON.stringify({ type, ...extra }));
+}
+
+function navigate() {
+  let url = $browserUrl.value.trim();
+  if (!url) return;
+  if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
+  $browserUrl.value = url;
+  $loading.classList.remove('hidden');
+  $loadText.textContent = '正在导航到 ' + url + '...';
+  sendControl('navigate', { url });
+}
+
+$browserUrl.addEventListener('keydown', e => { if (e.key === 'Enter') navigate(); });
+
+// ═══════════════════════════════════════════
+//  HID EVENTS
+// ═══════════════════════════════════════════
+
+function hid(type, payload) {
+  if (!connected || !ws) return;
+  const j = new TextEncoder().encode(JSON.stringify(payload));
+  const buf = new Uint8Array(1 + j.length);
+  buf[0] = type; buf.set(j, 1);
+  ws.send(buf.buffer);
+}
+
+function canvasPos(e) {
+  const r = $canvas.getBoundingClientRect();
+  return {
+    x: Math.round((e.clientX - r.left) * (viewport.w / r.width)),
+    y: Math.round((e.clientY - r.top) * (viewport.h / r.height)),
+  };
+}
+
+$canvas.addEventListener('mousemove', e => hid(HID.MOUSE_MOVE, canvasPos(e)));
+$canvas.addEventListener('mousedown', e => {
+  e.preventDefault(); $canvas.focus();
+  const btn = { 0: 'left', 1: 'middle', 2: 'right' }[e.button] || 'left';
+  hid(HID.MOUSE_DOWN, { ...canvasPos(e), button: btn });
+});
+$canvas.addEventListener('mouseup', e => {
+  const btn = { 0: 'left', 1: 'middle', 2: 'right' }[e.button] || 'left';
+  hid(HID.MOUSE_UP, { ...canvasPos(e), button: btn });
+});
+$canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  hid(HID.MOUSE_WHEEL, { x: 0, y: 0, deltaX: e.deltaX, deltaY: e.deltaY });
+}, { passive: false });
+$canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+$canvas.tabIndex = 0;
+$canvas.addEventListener('keydown', e => { e.preventDefault(); hid(HID.KEY_DOWN, { key: e.key, code: e.code }); });
+$canvas.addEventListener('keyup',   e => { e.preventDefault(); hid(HID.KEY_UP,   { key: e.key, code: e.code }); });
+
+// Touch
+$canvas.addEventListener('touchstart', e => {
+  e.preventDefault();
+  const p = canvasPos(e.touches[0]);
+  hid(HID.MOUSE_MOVE, p);
+  hid(HID.MOUSE_DOWN, { ...p, button: 'left' });
+}, { passive: false });
+$canvas.addEventListener('touchmove', e => {
+  e.preventDefault();
+  hid(HID.MOUSE_MOVE, canvasPos(e.touches[0]));
+}, { passive: false });
+$canvas.addEventListener('touchend', e => {
+  e.preventDefault();
+  hid(HID.MOUSE_UP, { x: 0, y: 0, button: 'left' });
+}, { passive: false });
+
+// Clipboard paste
+document.addEventListener('paste', e => {
+  if (document.activeElement !== $canvas || !connected) return;
+  const text = e.clipboardData?.getData('text/plain') || '';
+  if (text) sendControl('text', { value: text });
+});
+
+// ═══════════════════════════════════════════
+//  CANVAS SIZING
+// ═══════════════════════════════════════════
+
+function fitCanvas() {
+  const wrap = document.getElementById('canvas-wrap');
+  const maxW = wrap.clientWidth;
+  const maxH = wrap.clientHeight;
+  const ratio = viewport.w / viewport.h;
+  let w = maxW, h = w / ratio;
+  if (h > maxH) { h = maxH; w = h * ratio; }
+  $canvas.width = viewport.w;
+  $canvas.height = viewport.h;
+  $canvas.style.width = Math.floor(w) + 'px';
+  $canvas.style.height = Math.floor(h) + 'px';
+}
+window.addEventListener('resize', fitCanvas);
+
+// ═══════════════════════════════════════════
+//  STATS (1Hz)
+// ═══════════════════════════════════════════
+
+setInterval(() => {
+  if (!statsTs) { statsTs = performance.now(); return; }
+  const elapsed = (performance.now() - statsTs) / 1000;
+  $fps.textContent = Math.round(fpsN / elapsed);
+  $bw.textContent = Math.round((bytesRx / elapsed) / 1024);
+  fpsN = bytesRx = 0;
+  statsTs = performance.now();
+}, 1000);
+
+// Heartbeat + RTT
+setInterval(() => {
+  if (!connected || !ws) return;
+  const start = performance.now();
+  const orig = ws.onmessage;
+  ws.onmessage = ev => {
+    if (typeof ev.data === 'string') {
+      try { if (JSON.parse(ev.data).type === 'pong') $latency.textContent = 'RTT: ' + Math.round(performance.now() - start) + 'ms'; } catch (_) {}
+    }
+    ws.onmessage = orig;
+    if (ev.data instanceof ArrayBuffer) handleFrame(new Uint8Array(ev.data));
+    else if (typeof ev.data === 'string') handleText(ev.data);
+  };
+  sendControl('ping');
+}, 5000);
+
+// ═══════════════════════════════════════════
+//  HELPERS
+// ═══════════════════════════════════════════
+
+function setStatus(cls, txt) {
+  $statusDot.className = 'status-dot ' + cls;
+  $statusTxt.textContent = txt;
+}
+</script>
+</body>
+</html>
