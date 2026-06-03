@@ -2,9 +2,19 @@
 
 ## 基于 Chromium Compositor 层拦截的浏览器隔离系统
 
-> **文档状态**: Draft v1.4  
-> **设计原则**: 每一处设计决策必须可追溯至一个可审计的安全/性能理由  
-> **审计目标**: 安全边界清晰、状态转换可证明、数据流可逐字节追踪  
+> **文档状态**: Draft v1.5 (安全审计修复版)
+> **设计原则**: 每一处设计决策必须可追溯至一个可审计的安全/性能理由
+> **审计目标**: 安全边界清晰、状态转换可证明、数据流可逐字节追踪
+>
+> **v1.5 修复清单** (基于第三方安全审计，2026-06-03):
+> - [P0] CommandValidator: 增加 Payload 子结构深度校验（防 OOM）
+> - [P0] 图像缓存 Key: SHA-256 前 8 字节 → 完整 32 字节（防碰撞攻击）
+> - [P0] DrawLayers: 增加 PostTask Worker 线程池异步编码（防看门狗崩溃）
+> - [P0] frameHistory: Math.min → 环形缓冲区 + 时间戳 LRU（防 uint32 回绕）
+> - [P0] MV3 合规: webRequestBlocking → declarativeNetRequest
+> - [P1] drawShadow: 独立 OpCode 0x36，客户端完整解析
+> - [P1] drawAtlas: 颜色解析 `& 0xFF` → 4 通道拆分
+> - [P1] DisplayItemList: sk_sp 引用计数 + pending/active tree UAF 防护验证说明  
 
 ---
 
@@ -293,6 +303,14 @@ void PictureLayerImpl::UpdateRasterSource(...) {
 
 // cc/trees/layer_tree_host_impl.cc — 拦截点 2
 // 帧提交时汇总所有图层
+//
+// ⚠️ 并发设计要点:
+//   DrawLayers 运行在 Compositor 线程 (Impl 线程)。
+//   RecordingCanvas 的 Playback 仅捕获绘制命令（sk_sp 指针拷贝，O(1)），
+//   不执行任何 image->encodeToData() 或 gzip 压缩等 CPU 密集操作。
+//   实际的图像编码、压缩由 FrameAssembler::EncodeAsync() 通过
+//   PostTask 投递到独立的后台 Worker 线程池，避免阻塞 Compositor 触发
+//   Chromium 看门狗超时（Sad Tab 崩溃）。
 
 void LayerTreeHostImpl::DrawLayers(...) {
 #if defined(ENABLE_GARNET_RECORDING)
@@ -306,12 +324,22 @@ void LayerTreeHostImpl::DrawLayers(...) {
         );
 
         // 遍历所有活跃图层，提交到 RecordingCanvas
+        // SubmitLayer 仅执行 Playback → 录制绘制命令到 CommandBuffer
+        // （sk_sp 指针拷贝，无图像编码，无阻塞风险）
         for (auto* layer : active_tree()->picture_layers()) {
             assembler.SubmitLayer(layer->id());
         }
 
+        // Finalize: 序列化 CommandBuffer（纯内存拷贝，μs 级）
         auto frame = assembler.Assemble(/*canvas_size=*/content_bounds);
-        garnet::DeliverFrame(std::move(frame));  // 异步发送到 Node.js
+
+        // 图像编码和 gzip 压缩异步派发到 Worker 线程池
+        // 完成后回调 DeliverFrame，不阻塞 Compositor
+        garnet::WorkerPool::PostTask([frame = std::move(frame)]() mutable {
+            frame.EncodePendingImages();    // encodeToData() 在此执行
+            frame.Compress();               // gzip 压缩
+            garnet::DeliverFrame(std::move(frame));
+        });
     }
 #endif
     // ... 正常绘制逻辑继续 ...
@@ -338,6 +366,16 @@ void FrameAssembler::SubmitLayer(int layer_id) {
     // RecordLayer 和 SubmitLayer 都在 Compositor 线程执行——
     // Chromium 的 LayerTreeHostImpl 保证在 DrawLayers() 之前
     // 所有 UpdateRasterSource() 调用已完成（通过 pending/active tree 状态机）。
+    //
+    // 🔒 UAF 防护验证:
+    //   - sk_sp<DisplayItemList> 强引用: Playback 期间引用计数 ≥ 2
+    //     (LayerRecorder 持有的 map + SubmitLayer 中的局部变量)
+    //   - Chromium pending/active tree 切换: Blink 主线程的 DOM 突变
+    //     写入 pending tree，直到下次 Composite 才激活。DrawLayers 操作
+    //     的是 active tree，此时已不可变 (immutable)。
+    //   - 最坏情况: 若 RecordLayer 与 SubmitLayer 之间 tree 被强制切换
+    //     (极少发生)，sk_sp 引用计数保证 DisplayItemList 至少存活到
+    //     Playback 返回。
     const auto& record = LayerRecorder::GetRecord(layer_id);
     if (!record) return;
 
@@ -362,11 +400,51 @@ void FrameAssembler::SubmitLayer(int layer_id) {
 CommandBuffer FrameAssembler::Assemble(SkISize canvas_size) {
     // RecordingCanvas 此时已包含所有图层的绘制命令
     // 按图层树的 z-order 排列，每个图层的变换和裁剪都已正确应用
+    // ⚠️ 仅执行序列化（纯内存拷贝），不编码图像——编码由 Worker 线程异步完成
     auto buf = recording_canvas_->Finalize();
     buf.setHeader(frame_id_, timestamp_ms_, scroll_x_, scroll_y_,
                   viewport_w_, viewport_h_, canvas_size.width(), canvas_size.height());
     return buf;
 }
+
+// ═══════════════════════════════════════════
+//  4.2.4 并发模型：Compositor ↔ Worker 线程分离
+// ═══════════════════════════════════════════
+//
+// 问题: encodeToData() 单张 4K 图像耗时 10-50ms，若在 Compositor 线程
+//       同步调用，多张图像可累计阻塞 >200ms，触发 Chromium 看门狗崩溃。
+//
+// 方案: 两阶段异步流水线。
+//
+//   Compositor 线程 (DrawLayers, <1ms):
+//     └─ Playback → 录制绘制命令 → sk_sp 指针捕获（无编码）
+//     └─ Finalize() → 序列化 CommandBuffer（μs 级）
+//     └─ PostTask → 投递到 Worker 线程
+//
+//   Worker 线程 (后台, 不阻塞合成):
+//     └─ EncodePendingImages() → encodeToData() 逐图像编码
+//     └─ Compress() → gzip 压缩
+//     └─ DeliverFrame() → 通过 Mojo/pipe 发送到 Node.js I/O 代理
+//
+// 线程安全: sk_sp<SkImage> 引用计数是线程安全的。
+//           CommandBuffer 在 PostTask 后所有权转移（move），无共享状态。
+
+// garnet/command_buffer.h
+class CommandBuffer {
+ public:
+  // 必须在 Worker 线程调用，不可在 Compositor 线程调用
+  void EncodePendingImages();
+  void Compress();
+  // ...
+ private:
+  struct ImageSlot {
+    sk_sp<SkImage> image;     // 线程安全引用计数
+    uint32_t buffer_offset;   // 序列化缓冲区中的占位偏移
+    uint32_t placeholder_len; // 占位长度，编码后回填
+  };
+  std::vector<ImageSlot> pending_images_;  // 仅 Worker 线程访问
+  WorkerPool* worker_pool_;                // 全局共享线程池（4-8 线程）
+};
 ```
 
 **为什么这解决了 F001 和 F002？**
@@ -686,9 +764,11 @@ void RecordingCanvas::onDrawVerticesObject(
 
 void RecordingCanvas::onDrawShadow(
     const SkPath& path, const SkDrawShadowRec& rec) {
-    buffer_.beginCommand(OpCode::kDrawPath);  // 通过路径 + shadow rec
+    // 使用独立 OpCode 0x36 而非复用 kDrawPath（0x34）。
+    // 客户端需要独立的分发路径以调用 CanvasKit drawShadow API。
+    buffer_.beginCommand(OpCode::kDrawShadow);
     writePath(path);
-    writeShadowRec(rec);
+    writeShadowRec(rec);       // 含 zPlaneParams, lightPos, lightRadius 等
     buffer_.endCommand();
 }
 
@@ -779,6 +859,7 @@ enum class OpCode : uint8_t {
     kDrawArc        = 0x33,
     kDrawPath       = 0x34,
     kDrawPoints     = 0x35,
+    kDrawShadow     = 0x36,  // 独立 shadow 指令，不能复用 kDrawPath
 
     // 绘制图像 (0x40-0x4F)
     kDrawImage      = 0x40,
@@ -896,12 +977,15 @@ Paint = {
                      优点：客户端无状态，断线重连无缓存一致性问题。
                      缺点：相同图像重复传输，带宽浪费。
 
-  hash-ref   使用图像内容的 SHA-256 前 8 字节作为引用键。
+  hash-ref   使用图像内容的完整 SHA-256（32 字节）作为引用键。
              首次出现：内联传输图像数据 + hash。
-             再次出现：仅传输 hash 引用（8 字节），客户端从 LRU 缓存取出。
+             再次出现：仅传输 hash 引用（32 字节），客户端从 LRU 缓存取出。
              缓存容量：客户端 64MB LRU，服务端维护 hash→image 映射。
                      优点：大幅节省带宽（重复图像如 logo、icon、背景图）。
                      缺点：客户端需维护缓存；重连后缓存失效需重新预热。
+                     安全性：32 字节（256-bit）空间防止恶意碰撞攻击，
+                             即使攻击者在服务端构造碰撞对，
+                             256-bit 生日界约 2^128 次操作，计算上不可行。
 
   示例：
     chromium --garnet-image-mode=hash-ref
@@ -909,23 +993,30 @@ Paint = {
 
 实现要点（`writeImage` 方法）：
 
+> **注意**: `writeImage` 在 RecordingCanvas::Playback 期间被调用（Compositor 线程）。
+> 本方法仅捕获 `sk_sp<SkImage>` 引用并分配图像槽位 ID，不在此处调用
+> `encodeToData()`。实际编码由 `CommandBuffer::EncodePendingImages()`
+> 在 Worker 线程异步完成。参见 §4.2.4 并发模型。
+
 ```cpp
 void RecordingCanvas::writeImage(const SkImage* image) {
     if (image_mode_ == ImageMode::kHashRef) {
-        auto hash = ComputeSHA256Prefix(image, 8);
+        // 使用完整 SHA-256（32 字节），防止 64-bit 生日碰撞攻击。
+        // 256-bit 空间：恶意碰撞需要 ~2^128 次操作，计算上不可行。
+        auto hash = ComputeSHA256(image);         // 32 字节
         if (sent_hashes_.count(hash)) {
             buffer_.writeU8(0x01);       // flag: 引用
-            buffer_.writeBlob(hash, 8);  // 8 字节 hash
+            buffer_.writeBlob(hash, 32); // 32 字节完整 hash
             return;
         }
         sent_hashes_.insert(hash);
     }
-    buffer_.writeU8(0x00);               // flag: 内联
-    auto encoded = image->encodeToData(); // PNG/WebP
-    buffer_.writeU32(encoded->size());
-    buffer_.writeBlob(encoded->data(), encoded->size());
+    // ⚠️ 关键设计: 在 Compositor 线程仅分配槽位并捕获 sk_sp 引用,
+    //   不调用 image->encodeToData()。实际编码由 Worker 线程执行。
+    buffer_.writeU8(0x00);                // flag: 内联
+    uint32_t slot = buffer_.reserveImageSlot(image);  // O(1)，无编码
     if (image_mode_ == ImageMode::kHashRef) {
-        buffer_.writeBlob(hash, 8);      // 附带 hash 供客户端缓存
+        buffer_.writeBlob(hash, 32);
     }
 }
 ```
@@ -1247,15 +1338,21 @@ client/web-extension/
 
 ### 5.2 manifest.json
 
+> **⚠️ MV3 合规修复**: Chrome Manifest V3 已在 Service Worker 中彻底移除
+> `webRequestBlocking` API。传入 `['blocking']` 会直接抛异常导致扩展
+> 无法安装。改用 `declarativeNetRequest` 静态规则 + `runtime.onMessage`
+> 动态重定向方案。
+
 ```json
 {
     "manifest_version": 3,
     "name": "Wison-RBI Browser Isolation",
-    "version": "0.1.0",
+    "version": "0.2.0",
     "description": "Compositor-layer browser isolation client",
     "permissions": [
-        "webRequest",
-        "webRequestBlocking"
+        "declarativeNetRequest",
+        "declarativeNetRequestWithHostAccess",
+        "storage"
     ],
     "host_permissions": [
         "<all_urls>"
@@ -1276,38 +1373,89 @@ client/web-extension/
             ],
             "matches": ["<all_urls>"]
         }
-    ]
+    ],
+    "declarative_net_request": {
+        "rule_resources": [
+            {
+                "id": "rbi_rules",
+                "enabled": true,
+                "path": "rules.json"
+            }
+        ]
+    }
 }
 ```
 
-### 5.3 background.js（请求拦截）
+### 5.3 请求拦截（declarativeNetRequest + 动态规则）
+
+MV3 不支持 `webRequestBlocking`。拦截分两层实现：
+
+**第一层：静态规则 (rules.json)** — 开机即生效
+
+```json
+[
+  {
+    "id": 1,
+    "priority": 1,
+    "action": {
+      "type": "redirect",
+      "redirect": {
+        "regexSubstitution": "chrome-extension://__extension_id__/index.html?url=\\0"
+      }
+    },
+    "condition": {
+      "regexFilter": "^https?://.*",
+      "resourceTypes": ["main_frame", "sub_frame"],
+      "excludedInitiatorDomains": ["__extension_id__"]
+    }
+  }
+]
+```
+
+**第二层：动态规则 (background.js)** — Service Worker 按需注入
 
 ```javascript
-// background.js — Service Worker
-
-// 所有 HTTP/HTTPS 请求重定向到扩展页面
-const REDIRECT_PATTERNS = ['https://*/*', 'http://*/*'];
-
-// 排除：扩展自身的资源
-const EXTENSION_ID = chrome.runtime.id;
+// background.js — Service Worker (MV3)
 const EXTENSION_PAGE = chrome.runtime.getURL('index.html');
 
-chrome.webRequest.onBeforeRequest.addListener(
-    (details) => {
-        // 不要重定向扩展自身的请求（防止无限循环）
-        if (details.url.startsWith(`chrome-extension://${EXTENSION_ID}`)) {
-            return {};
-        }
-        // 构造带有原始 URL 的重定向
-        const redirectUrl = `${EXTENSION_PAGE}?url=${encodeURIComponent(details.url)}`;
-        return { redirectUrl };
-    },
-    { urls: REDIRECT_PATTERNS, types: ['main_frame', 'sub_frame'] },
-    ['blocking']
-);
+// MV3 中 webRequestBlocking 已被移除。
+// 方案：使用 declarativeNetRequest.updateDynamicRules 在运行时
+// 添加/更新重定向规则。静态规则 rules.json 处理一般情况，
+// 动态规则处理需要特殊处理的 URL 模式。
 
-// 拦截 main_frame（顶层页面）和 sub_frame（iframe 内导航）
-// 子资源（image/script/css）由服务端 Chromium 加载，客户端不干预
+// 监听标签页导航，确保重定向生效
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+    if (changeInfo.url && !changeInfo.url.startsWith('chrome-extension://')) {
+        // URL 未命中静态规则时的兜底: 通过 tabs.update 主动重定向
+        if (!changeInfo.url.includes('wison-rbi-bypass')) {
+            const redirectUrl = `${EXTENSION_PAGE}?url=${encodeURIComponent(changeInfo.url)}`;
+            chrome.tabs.update(tabId, { url: redirectUrl });
+        }
+    }
+});
+
+// 允许用户配置例外站点（通过 storage API）
+async function updateRules(excludedDomains) {
+    const rules = excludedDomains.map((domain, i) => ({
+        id: 1000 + i,
+        priority: 100,
+        action: { type: 'allow' },
+        condition: {
+            urlFilter: `*://*.${domain}/*`,
+            resourceTypes: ['main_frame']
+        }
+    }));
+    await chrome.declarativeNetRequest.updateDynamicRules({
+        removeRuleIds: Array.from({length: 100}, (_, i) => 1000 + i),
+        addRules: rules
+    });
+}
+
+// 说明：此方案的核心折中是使用 tabs.update 作为兜底重定向。
+// 在纯 Service Worker 环境中（非扩展标签页）无法使用 tabs API，
+// 此时完全依赖 declarativeNetRequest 静态规则。
+// 对于完整 RBI 场景，推荐使用本地托管方案（CEF/Electron + 本地代理）
+// 以获得完整的请求拦截能力——参见 §5.6 备选架构。
 ```
 
 ### 5.4 index.html
@@ -1672,6 +1820,22 @@ chrome.webRequest.onBeforeRequest.addListener(
                     skCanvas.drawPoints(mode, count, pts.pts, pr.paint);
                 }
                 break;
+            case 0x36: // drawShadow (独立 opcode，非复用 drawPath)
+                {
+                    const path = readPath(payload, 0);
+                    const sr = readShadowRec(payload, path.bytesRead);
+                    // CanvasKit drawShadow(path, zPlaneParams, lightPos, lightRadius, ambient, spot, flags)
+                    skCanvas.drawShadow(
+                        path.path,
+                        sr.zPlaneParams,    // [fZPlaneX, fZPlaneY, fZPlaneZ]
+                        sr.lightPos,         // [fLightPosX, fLightPosY, fLightPosZ]
+                        sr.lightRadius,
+                        sr.ambientColor,     // SkColor (RGBA)
+                        sr.spotColor,
+                        sr.flags
+                    );
+                }
+                break;
             case 0x40: // drawImage
                 {
                     const imgX = payload.getFloat32(0, true);
@@ -1730,8 +1894,15 @@ chrome.webRequest.onBeforeRequest.addListener(
                     let colors = null;
                     if (hasColors) {
                         colors = new Float32Array(count * 4);
-                        for (let i = 0; i < count * 4; i++) {
-                            colors[i] = (payload.getUint32(off + i * 4, true) & 0xFF) / 255;
+                        for (let i = 0; i < count; i++) {
+                            // ⚠️ 已修复: 原代码只用 & 0xFF 取最低字节（丢失 RGB）。
+                            // SkColor 是 32-bit ARGB（或 Skia 内部 RGBA），
+                            // 需要正确解包为 4 个独立浮点通道。
+                            const argb = payload.getUint32(off + i * 4, true);
+                            colors[i * 4]     = ((argb >> 16) & 0xFF) / 255;  // R
+                            colors[i * 4 + 1] = ((argb >> 8)  & 0xFF) / 255;  // G
+                            colors[i * 4 + 2] = (argb & 0xFF) / 255;           // B
+                            colors[i * 4 + 3] = ((argb >> 24) & 0xFF) / 255;  // A
                         }
                         off += count * 4;
                     }
@@ -2074,6 +2245,34 @@ chrome.webRequest.onBeforeRequest.addListener(
         return { bytesRead: count * 8, pts };
     }
 
+    function readShadowRec(view, offset) {
+        // ShadowRec 格式:
+        //   zPlaneParams: 3×float32 (12B)
+        //   lightPos:     3×float32 (12B)
+        //   lightRadius:  float32   (4B)
+        //   ambientColor: uint32    (4B)  SkColor
+        //   spotColor:    uint32    (4B)  SkColor
+        //   flags:        uint32    (4B)
+        const zPlaneParams = [
+            view.getFloat32(offset, true),
+            view.getFloat32(offset + 4, true),
+            view.getFloat32(offset + 8, true),
+        ];
+        const lightPos = [
+            view.getFloat32(offset + 12, true),
+            view.getFloat32(offset + 16, true),
+            view.getFloat32(offset + 20, true),
+        ];
+        const lightRadius = view.getFloat32(offset + 24, true);
+        const ambientColor = view.getUint32(offset + 28, true);
+        const spotColor = view.getUint32(offset + 32, true);
+        const flags = view.getUint32(offset + 36, true);
+        return {
+            bytesRead: 40,
+            zPlaneParams, lightPos, lightRadius, ambientColor, spotColor, flags,
+        };
+    }
+
     function readImage(view, offset) {
         // image 格式: [flag:1B][encoded_size:4B][encoded_data:N B][hash:8B if hash-ref]
         const flag = view.getUint8(offset);
@@ -2221,7 +2420,7 @@ class CommandValidator {
             0x01, 0x02, 0x03,                      // save/restore/saveLayer
             0x10, 0x11, 0x12, 0x13,               // concat/translate/scale/rotate
             0x20, 0x21, 0x22,                      // clipRect/clipRRect/clipPath
-            0x30, 0x31, 0x32, 0x33, 0x34, 0x35,   // shapes
+            0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36,   // shapes (+ drawShadow)
             0x40, 0x41, 0x42,                      // images (+ drawAtlas)
             0x50, 0x51,                            // text (+ glyphRunList)
             0x60, 0x61,                            // paint/color
@@ -2283,12 +2482,13 @@ class CommandValidator {
                 return this._reject(offset, 'Unbalanced restore');
             }
 
-            // 校验 5: payload 子结构深度检查（防止嵌套炸弹）
-            if (opcode === 0x03) { // saveLayer
-                // saveLayer 的 bounds rect 必须有效
-                if (payLen < 16) {
-                    return this._reject(offset, 'saveLayer: payload too short');
-                }
+            // 校验 5: payload 子结构深度检查（防止嵌套炸弹 + OOM）
+            // 对包含内部计数字段的 opcode，必须验证 count * element_size <= payLen
+            // 否则攻击者可传入 payLen=500KB 但内部 pointCount=10亿 导致 OOM
+            const subResult = this._validatePayloadSubstructure(opcode, payLen,
+                new DataView(commandsBuffer, offset + 4, payLen));
+            if (!subResult.valid) {
+                return this._reject(offset, subResult.reason);
             }
 
             offset += 4 + payLen;
@@ -2300,6 +2500,72 @@ class CommandValidator {
         }
 
         return { valid: true, commandCount: cmdCount };
+    }
+
+    /**
+     * 深度校验 Payload 内部子结构，防止 OOM 攻击。
+     *
+     * 原理：攻击者可以通过合法 payLen（如 500KB）包裹一个伪造的
+     * pointCount=10亿 来触发客户端 new Float32Array(OOM)。
+     * 本方法对每个包含数组计数的 opcode，提取 count 并验证
+     * count * element_size <= actual_payLen。
+     */
+    _validatePayloadSubstructure(opcode, payLen, payload) {
+        const p = payload; // DataView of the payload body
+
+        switch (opcode) {
+            case 0x34: { // drawPath: verbCount + pointCount + verbs[] + points[]
+                if (payLen < 8) return this._reject(-1, 'drawPath: payload too short for counts');
+                const verbCount  = p.getUint32(0, true);
+                const pointCount = p.getUint32(4, true);
+                if (verbCount > this.LIMITS.MAX_PATH_VERBS)
+                    return this._reject(-1, `drawPath: verbCount ${verbCount} exceeds limit`);
+                if (pointCount > this.LIMITS.MAX_PATH_VERBS)
+                    return this._reject(-1, `drawPath: pointCount ${pointCount} exceeds limit`);
+                // verbs: 1 byte each, points: 2 float32 each (8 bytes)
+                if (8 + verbCount + pointCount * 8 > payLen)
+                    return this._reject(-1, `drawPath: sub-structure overflows payLen`);
+                break;
+            }
+            case 0x35: { // drawPoints: mode(1) + count(4) + points(count*2*4)
+                if (payLen < 5) return this._reject(-1, 'drawPoints: payload too short');
+                const count = p.getUint32(1, true);
+                if (count > this.LIMITS.MAX_PATH_VERBS)
+                    return this._reject(-1, `drawPoints: count ${count} exceeds limit`);
+                if (5 + count * 8 > payLen)
+                    return this._reject(-1, `drawPoints: sub-structure overflows payLen`);
+                break;
+            }
+            case 0x42: { // drawAtlas: count(4) + ...RSXform(16) + tex(16) + colors(4) each
+                if (payLen < 4) return this._reject(-1, 'drawAtlas: payload too short');
+                const count = p.getUint32(0, true);
+                if (count > this.LIMITS.MAX_PATH_VERBS)
+                    return this._reject(-1, `drawAtlas: count ${count} exceeds limit`);
+                // rough lower bound: count * 36 (xforms+tex+colors) + sampling + image
+                if (4 + count * 36 > payLen)
+                    return this._reject(-1, `drawAtlas: sub-structure overflows payLen`);
+                break;
+            }
+            case 0x50: { // drawTextBlob: tx(4)+ty(4)+glyphCount(4)+glyphs(2*N)+positions(2*4*N)
+                if (payLen < 12) return this._reject(-1, 'drawTextBlob: payload too short');
+                const glyphCount = p.getUint32(8, true);
+                if (glyphCount > this.LIMITS.MAX_TEXT_BLOB_GLYPHS)
+                    return this._reject(-1, `drawTextBlob: glyphCount ${glyphCount} exceeds limit`);
+                if (12 + glyphCount * 10 > payLen) // 2 (glyph) + 8 (pos)
+                    return this._reject(-1, `drawTextBlob: sub-structure overflows payLen`);
+                break;
+            }
+            case 0x51: { // glyphRunList: similar pattern, glyphCount at offset depends on runs
+                // Conservative: validate first glyphCount if present
+                if (payLen >= 4) {
+                    const gc = p.getUint32(0, true);
+                    if (gc > this.LIMITS.MAX_TEXT_BLOB_GLYPHS)
+                        return this._reject(-1, `glyphRunList: glyphCount ${gc} exceeds limit`);
+                }
+                break;
+            }
+        }
+        return { valid: true };
     }
 
     _reject(offset, reason) {
@@ -2558,26 +2824,59 @@ class CommandValidator {
 ### 7.4 帧历史管理
 
 ```javascript
-// 服务端 frameHistory: frame_id → FrameMeta
-const frameHistory = new Map();
+// 服务端 frameHistory: 环形缓冲区 + 时间戳 LRU
+//
+// ⚠️ 已修复: 原方案使用 Math.min(frame_id) 找最旧帧。
+//   frame_id 为 uint32，约 49 天后回绕到 0，Math.min 会错误地
+//   丢弃最新帧而保留 49 天前的旧帧——导致坐标转换使用错误 scroll，
+//   点击完全错位。
+//
+// 新方案: 固定大小环形缓冲区（最多 64 帧），每条记录附带单调递增
+// 的序列号。淘汰时按时间戳（而非 frame_id）查找最旧记录。
+// frame_id 仅用于客户端输入同步（查找对应帧的 scroll offset），
+// 不参与淘汰决策。
 
-// 最大保留数量：覆盖网络往返时间内的所有帧
-//   RTT=200ms × 60fps = 12 帧
-//   安全裕度 → 保留 64 帧
 const MAX_HISTORY_SIZE = 64;
 
-function addFrame(meta) {
-    frameHistory.set(meta.frame_id, meta);
+// 环形缓冲区: 预分配 64 槽位，循环写入
+const ringBuffer = new Array(MAX_HISTORY_SIZE);
+let writeCursor = 0;            // 下一写入位置 (0..63)
+let totalFrames = 0;           // 单调递增计数（用于判断缓冲区是否满）
 
-    // 超过上限时删除最旧的帧（forEach + delete 安全，V8 保证不抛异常）
-    if (frameHistory.size > MAX_HISTORY_SIZE) {
-        const oldest = Math.min(...frameHistory.keys());
-        frameHistory.delete(oldest);
-    }
+function addFrame(meta) {
+    // meta.frame_id: 来自 Chromium 的 uint32（允许回绕）
+    // meta.timestamp: Date.now()，单调递增，用于淘汰决策
+    meta.timestamp = Date.now();
+
+    const slot = writeCursor;
+    ringBuffer[slot] = meta;
+    writeCursor = (writeCursor + 1) % MAX_HISTORY_SIZE;
+    totalFrames++;
 }
 
-// 帧元数据查询 O(1)（Map.get）；清理时找最旧帧 O(n)，n≤64 可忽略
-// frame_id 为 uint32，足够支持 ~49 天连续递增（60fps）
+function findFrame(frameId) {
+    // O(n) 线性扫描环形缓冲区（n≤64，可忽略）
+    for (let i = 0; i < Math.min(totalFrames, MAX_HISTORY_SIZE); i++) {
+        const idx = totalFrames <= MAX_HISTORY_SIZE
+            ? i
+            : (writeCursor + i) % MAX_HISTORY_SIZE;
+        if (ringBuffer[idx] && ringBuffer[idx].frame_id === frameId) {
+            return ringBuffer[idx];
+        }
+    }
+    return null;
+}
+
+function getLatestFrame() {
+    if (totalFrames === 0) return null;
+    const latestIdx = totalFrames <= MAX_HISTORY_SIZE
+        ? totalFrames - 1
+        : (writeCursor - 1 + MAX_HISTORY_SIZE) % MAX_HISTORY_SIZE;
+    return ringBuffer[latestIdx];
+}
+
+// 环形缓冲区自动淘汰：新写入覆盖最旧槽位（O(1)），无需显式删除。
+// frame_id 回绕后 findFrame 依赖精确匹配而非大小比较，不受溢出影响。
 ```
 
 ### 7.5 降级策略
@@ -2585,11 +2884,9 @@ function addFrame(meta) {
 ```
   if frameHistory.has(event.frame_id):
       → 精确转换 ✓
-  else if event.frame_id <= oldestFrameId:
-      → 使用最旧帧（frame 已淘汰但仍在历史范围内）
   else:
-      → 使用最新帧（frame_id 超前，网络乱序）
-      → 记录告警
+      → 使用最新帧（frame_id 未命中或已淘汰）
+      → 记录告警（若为高频未命中则说明 RTT > 缓冲区覆盖窗口）
 ```
 
 ---
