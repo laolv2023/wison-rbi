@@ -91,7 +91,7 @@ class InputProxy {
   /** 令牌桶：消耗一个令牌。返回 true 表示允许通过。 */
   _consumeToken() {
     const now = Date.now();
-    const elapsed = (now - this._lastRefill) / 1000;
+    const elapsed = Math.max(0, (now - this._lastRefill) / 1000);  // v1.10: 防系统时钟后退
     this._tokens = Math.min(this._maxTokens, this._tokens + elapsed * this._refillRate);
     this._lastRefill = now;
 

@@ -131,7 +131,15 @@
 
   // Renderer (needs CanvasKit)
   loadText.textContent = '正在加载 CanvasKit...';
-  const canvasKit = await CanvasKitInit({ locateFile: (f) => 'https://unpkg.com/canvaskit-wasm@0.39.1/bin/' + f });
+  let canvasKit;
+  try {
+    canvasKit = await CanvasKitInit({ locateFile: (f) => 'https://unpkg.com/canvaskit-wasm@0.39.1/bin/' + f });
+  } catch (err) {
+    loadText.textContent = 'CanvasKit 加载失败，请刷新重试';
+    loading.style.display = 'flex';
+    console.error('[wison] CanvasKit init failed:', err);
+    throw err;  // 阻止后续初始化
+  }
   loadText.textContent = '正在连接服务端...';
 
   const renderer = new Renderer(canvas, canvasKit, {

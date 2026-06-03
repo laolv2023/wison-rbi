@@ -47,10 +47,12 @@ class Session {
     this._frameLoop = null;
     this._frameSeq = 0;
     this._capturing = false;  // v1.7: 帧循环互斥锁
+    this._restartAttempts = 0;  // v1.10: Chromium 重启重试计数
 
     // 统计
     this._createdAt = Date.now();
     this._framesSent = 0;
+    this._framesSkipped = 0;  // v1.10
     this._bytesSent = 0;
     this._lastActivity = Date.now();
   }
@@ -213,6 +215,7 @@ class Session {
     const result = await this._capture.capture();
     if (!result) return; // 无变化
 
+    this._lastActivity = Date.now();  // v1.10: 帧捕获成功视为活跃
     this._frameSeq++;
 
     // 获取滚动偏移
@@ -256,6 +259,13 @@ class Session {
   }
 
   async _restartChromium() {
+    // v1.10: 重试上限保护
+    if (++this._restartAttempts > 3) {
+      this._log.error('Restart limit exceeded, destroying session');
+      this._running = false;
+      this.destroy().catch(() => {});
+      return;
+    }
     this._log.info('Restarting Chromium...');
     try {
       await this._cdp?.disconnect().catch(() => {});
@@ -287,6 +297,7 @@ class Session {
       this._input = new InputProxy(this._cdp, this._log);
 
       await this.navigate(this._currentUrl);
+      this._restartAttempts = 0;  // v1.10: 成功后重置计数
       this._notifyStatus({ url: this._currentUrl, loading: false });
       this._log.info('Chromium restarted');
     } catch (err) {

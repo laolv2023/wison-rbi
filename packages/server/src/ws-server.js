@@ -202,8 +202,8 @@ class WsServer {
       if (ws._wisonSessionId === sessionId && ws.readyState === WebSocket.OPEN) {
         // 背压检查
         if (ws.bufferedAmount > 1024 * 1024) {
-          // 客户端跟不上，跳过非关键帧
           this._log.trace({ sessionId, buffered: ws.bufferedAmount }, 'Backpressure, skipping frame');
+          session._framesSkipped = (session._framesSkipped || 0) + 1;  // v1.10
           return;
         }
         ws.send(arrayBuffer, { binary: true }, (err) => {

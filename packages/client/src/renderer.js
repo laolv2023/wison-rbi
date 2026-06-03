@@ -52,7 +52,15 @@ class Renderer {
    * @returns {{ rendered: boolean, reason?: string }}
    */
   render(frameData) {
-    if (!this._skCanvas) return { rendered: false, reason: 'No SkCanvas' };
+    if (!this._skCanvas) {
+      // v1.10: SkCanvas 失败计入 rejection，触发 request_keyframe
+      this._rejectionCount++;
+      if (this._rejectionCount >= this._maxRejections && this._onRequestKeyframe) {
+        this._onRequestKeyframe();
+        this._rejectionCount = 0;
+      }
+      return { rendered: false, reason: 'No SkCanvas' };
+    }
 
     try {
       // Step 1: 解码
