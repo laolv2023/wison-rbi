@@ -293,6 +293,11 @@ class Session {
   _notifyStatus(msg) {
     this._onStatus(this.id, { type: 'status', ...msg });
   }
+
+  /** v1.8: 公开状态通知（供 WsServer 调用） */
+  notifyStatus(msg) {
+    this._notifyStatus(msg);
+  }
 }
 
 module.exports = { Session };

@@ -43,24 +43,20 @@ class WsServer {
     // 空闲回收定时器
     this._idleTimer = setInterval(() => this._reapIdleSessions(), 60000);
 
+    // v1.8: _cleanedSessions 定期清理（防止无限增长）
+    this._cleanupTimer = setInterval(() => {
+      if (this._cleanedSessions.size > 10000) this._cleanedSessions.clear();
+    }, 300000).unref();
+
     this._log.info({ maxSessions: config.maxSessions }, 'WebSocket server ready');
   }
 
   /** 客户端连接验证 */
   _verifyClient(info, cb) {
-    // Token 认证
-    if (config.authToken) {
-      const authHeader = info.req.headers['authorization'] || '';
-      const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
-      if (token !== config.authToken) {
-        this._log.warn({ ip: info.req.socket.remoteAddress }, 'Auth failed');
-        cb(false, 401, 'Unauthorized');
-        return;
-      }
-    }
+    // v1.8: 认证全量移至消息层（_handleControl 'auth'），浏览器兼容
 
     // IP 限流
-    const ip = info.req.socket.remoteAddress || 'unknown';
+    const ip = (info.req.socket.remoteAddress || 'unknown').replace(/^::ffff:/, '');
     const current = this._ipConnections.get(ip) || 0;
     if (current >= 3) {
       this._log.warn({ ip, current }, 'IP connection limit reached');
@@ -81,7 +77,7 @@ class WsServer {
   /** 新 WebSocket 连接 */
   _onConnection(ws, req) {
     const sessionId = `sess_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    const ip = req.socket.remoteAddress || 'unknown';
+    const ip = (req.socket.remoteAddress || 'unknown').replace(/^::ffff:/, '');
 
     // 标记 WebSocket 所属会话
     ws._wisonSessionId = sessionId;
@@ -144,9 +140,14 @@ class WsServer {
   /** 处理控制消息 */
   async _handleControl(session, msg) {
     switch (msg.type) {
-      case 'auth':  // v1.7: 浏览器 WebSocket 无法发送 HTTP 头，通过首个消息认证
+      case 'auth':  // v1.8: 统一消息层认证（浏览器+API 兼容）
         if (!config.authToken) { session._authenticated = true; break; }
-        const bufA = Buffer.from(msg.token || '');
+        if (typeof msg.token !== 'string' || msg.token.length === 0) {
+          this._log.warn({ sessionId: session.id }, 'Auth token invalid type');
+          this._closeSession(session.id);
+          break;
+        }
+        const bufA = Buffer.from(msg.token);
         const bufB = Buffer.from(config.authToken);
         if (bufA.length === bufB.length && crypto.timingSafeEqual(bufA, bufB)) {
           session._authenticated = true;
@@ -163,7 +164,7 @@ class WsServer {
           try { parsed = new URL(msg.url); } catch (_) { return; }
           if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
             this._log.warn({ url: msg.url }, 'Blocked non-HTTP(S) URL');
-            session._notifyStatus({ error: 'NAVIGATION_FAILED', message: 'Only http/https allowed' });
+            session.notifyStatus({ error: 'NAVIGATION_FAILED', message: 'Only http/https allowed' });
             return;
           }
           await session.start(msg.url).catch(err =>
@@ -172,7 +173,7 @@ class WsServer {
         }
         break;
       case 'resize':
-        if (msg.width && msg.height) {
+        if (msg.width > 0 && msg.width <= 16384 && msg.height > 0 && msg.height <= 16384) {
           await session.resize(msg.width, msg.height);
         }
         break;
@@ -263,10 +264,45 @@ class WsServer {
         // 关闭关联的 WebSocket
         for (const ws of this._wss.clients) {
           if (ws._wisonSessionId === sessionId) {
-            ws.close(1001, 'Heartbeat timeout');  // v1.7: 使用 close 而非 terminate
+            ws.close(1001, 'Heartbeat timeout');
             break;
+          }
+        }
+        this._sessions.get(sessionId)?.destroy().catch(() => {});
+        this._sessions.delete(sessionId);
+        this._heartbeats.delete(sessionId);
+      }
+    }
+  }
 
-    // 销毁所有会话
+  /** 空闲会话回收 */
+  _reapIdleSessions() {
+    for (const [sessionId, session] of this._sessions) {
+      if (session.isIdle()) {
+        this._log.info({ sessionId }, 'Reaping idle session');
+        for (const ws of this._wss.clients) {
+          if (ws._wisonSessionId === sessionId) {
+            ws.close(1000, 'Idle timeout');
+            break;
+          }
+        }
+        session.destroy().catch(() => {});
+        this._sessions.delete(sessionId);
+        this._heartbeats.delete(sessionId);
+      }
+    }
+  }
+
+  /** 优雅关闭 */
+  async shutdown() {
+    clearInterval(this._heartbeatTimer);
+    clearInterval(this._idleTimer);
+    clearInterval(this._cleanupTimer);
+
+    for (const ws of this._wss.clients) {
+      ws.close(1001, 'Server shutting down');
+    }
+
     const promises = [];
     for (const session of this._sessions.values()) {
       promises.push(session.destroy().catch(() => {}));
@@ -275,6 +311,11 @@ class WsServer {
     this._sessions.clear();
 
     this._log.info('WebSocket server shut down');
+  }
+
+  /** v1.8: 获取当前活跃会话数 */
+  getSessionCount() {
+    return this._sessions.size;
   }
 }
 

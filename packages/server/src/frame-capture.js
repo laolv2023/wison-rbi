@@ -55,7 +55,7 @@ class FrameCapture {
       .toBuffer({ resolveWithObject: true });
 
     // 计算脏 tile 列表（基于 raw pixel hash）
-    const dirtyList = this._computeDirtyTiles(rawPixels, width);
+    const dirtyList = this._computeDirtyTiles(rawPixels, width, height);
     this._frameCount++;
 
     if (dirtyList.length === 0) return null;
@@ -71,7 +71,7 @@ class FrameCapture {
       const screenshotJpeg = await this._page.screenshot({
         type: 'jpeg', quality: 70, fullPage: false,
       });
-      this._updateAllHashes(rawPixels, width);
+      this._updateAllHashes(rawPixels, width, height);
       return {
         frameType: 0x01,
         tiles: [{
@@ -101,7 +101,7 @@ class FrameCapture {
   }
 
   /** v1.7: 基于 raw pixel 的逐 tile 哈希对比 */
-  _computeDirtyTiles(rawPixels, imgWidth) {
+  _computeDirtyTiles(rawPixels, imgWidth, imgHeight) {
     const dirty = [];
     const hash = (buf) => crypto.createHash('md5').update(buf).digest('hex');
     const bytesPerPixel = 4; // RGBA
@@ -114,7 +114,7 @@ class FrameCapture {
 
       // 提取 tile 区域的像素行
       const tileBytes = Buffer.allocUnsafe(this._tileSize * this._tileSize * bytesPerPixel);
-      for (let py = 0; py < this._tileSize && (tileY + py) < imgWidth/*height*/; py++) {
+      for (let py = 0; py < this._tileSize && (tileY + py) < imgHeight; py++) {
         const srcOff = ((tileY + py) * imgWidth + tileX) * bytesPerPixel;
         const dstOff = py * this._tileSize * bytesPerPixel;
         const lineLen = Math.min(this._tileSize, imgWidth - tileX) * bytesPerPixel;
@@ -130,7 +130,7 @@ class FrameCapture {
     return dirty;
   }
 
-  _updateAllHashes(rawPixels, imgWidth) {
+  _updateAllHashes(rawPixels, imgWidth, imgHeight) {
     const hash = (buf) => crypto.createHash('md5').update(buf).digest('hex');
     const bytesPerPixel = 4;
     for (let tileIdx = 0; tileIdx < this._totalTiles; tileIdx++) {
@@ -139,7 +139,7 @@ class FrameCapture {
       const tileX = col * this._tileSize;
       const tileY = row * this._tileSize;
       const tileBytes = Buffer.allocUnsafe(this._tileSize * this._tileSize * bytesPerPixel);
-      for (let py = 0; py < this._tileSize; py++) {
+      for (let py = 0; py < this._tileSize && (tileY + py) < imgHeight; py++) {
         const srcOff = ((tileY + py) * imgWidth + tileX) * bytesPerPixel;
         const dstOff = py * this._tileSize * bytesPerPixel;
         const lineLen = Math.min(this._tileSize, imgWidth - tileX) * bytesPerPixel;

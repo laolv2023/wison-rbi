@@ -62,7 +62,7 @@ function requestListener(req, res) {
       status: 'ok',
       version: '0.1.0',
       uptime: Math.round((Date.now() - metrics.startTime) / 1000),
-      sessions: wsServer?._sessions?.size || 0,
+      sessions: wsServer ? wsServer.getSessionCount() : 0,
       memory: process.memoryUsage(),
     }));
     return;
@@ -73,7 +73,7 @@ function requestListener(req, res) {
     const lines = [
       '# HELP wison_sessions_active Active sessions',
       '# TYPE wison_sessions_active gauge',
-      `wison_sessions_active ${wsServer?._sessions?.size || 0}`,
+      `wison_sessions_active ${wsServer ? wsServer.getSessionCount() : 0}`,
       '# HELP wison_frames_sent_total Total frames sent',
       '# TYPE wison_frames_sent_total counter',
       `wison_frames_sent_total ${metrics.framesSent}`,
