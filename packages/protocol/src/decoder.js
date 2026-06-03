@@ -94,7 +94,10 @@ class FrameDecoder {
       tiles.push({ x, y, w, h, encoding, dataLen, dataOffset: -1 });
     }
 
-    // ── Tile data ──
+    // ══════════════════════════════════════════════════════════
+    // 第三步: 瓦片二进制数据 (原始 JPEG/PNG 字节流)
+    // 每个瓦片的 dataOffset 指向其在帧中的绝对偏移
+    // ══════════════════════════════════════════════════════════
     for (let i = 0; i < tileCount; i++) {
       check(tiles[i].dataLen, `tile[${i}] data`);
       tiles[i].dataOffset = off;

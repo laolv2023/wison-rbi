@@ -17,6 +17,22 @@ const config = require('./config');
 const { Limits } = config;
 
 class WsServer {
+  // ════════════════════════════════════════════════════════════
+  // WebSocket 服务器 —— 负责连接管理、认证、消息路由
+  //
+  // 连接生命周期:
+  //   _verifyClient (握手指纹) → _onConnection (创建 Session)
+  //   → 消息处理 (text=JSON控制, binary=HID事件)
+  //   → _cleanupSession (连接关闭/错误)
+  //
+  // 安全机制:
+  //   - 消息层 Token 认证 (v1.8: 统一浏览器+API客户端)
+  //   - IP 限流 (每 IP 最多 N 连接，可配置)
+  //   - 背压检测 (bufferedAmount > 1MB → 跳帧)
+  //   - 心跳超时 (15s 无消息 → 断连)
+  //   - 防重入 (_cleanedSessions Set)
+  // ════════════════════════════════════════════════════════════
+
   /**
    * @param {import('http').Server} httpServer
    * @param {object} logger

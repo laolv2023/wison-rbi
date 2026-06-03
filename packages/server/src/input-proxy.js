@@ -10,6 +10,23 @@
 const { HIDType, Limits } = require('../../protocol/src/constants');
 
 class InputProxy {
+  // ════════════════════════════════════════════════════════════
+  // 输入代理 —— HID 事件 → CDP Input.dispatch* 命令
+  //
+  // 限流策略 (令牌桶):
+  //   - 正常速率: 125 events/s (HID_RATE_LIMIT_HZ)
+  //   - 突发容量: 250 tokens (HID_BURST_LIMIT)
+  //   - 超出限制: 事件静默丢弃，不通知客户端
+  //
+  // 事件类型:
+  //   0x10-0x13: 鼠标事件 (move/down/up/wheel)
+  //   0x14-0x15: 键盘事件 (down/up)
+  //   0x16-0x18: 触屏事件 (start/move/end)
+  //   0x20:      文本注入 (insertText)
+  //
+  // ⚠️ v1.10: 系统时钟后退防护 (Math.max(0, elapsed))
+  // ════════════════════════════════════════════════════════════
+
   /**
    * @param {import('./cdp-client').CdpClient} cdp
    * @param {object} logger

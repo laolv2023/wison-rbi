@@ -120,70 +120,76 @@ class FrameEncoder {
    * @returns {ArrayBuffer}
    */
   finalize(frameType) {
-    // 计算总大小
-    let size = C.FRAME_HEADER_SIZE + 2; // header + tileCount(2)
+    // ── 第一步: 计算帧总大小 ──
+    // 帧头(30) + tileCount(2) + 瓦片条目(N×14) + 瓦片数据 + 命令(N×(4+payload)) + CRC32(4)
+    let size = C.FRAME_HEADER_SIZE + 2;
     size += this._tiles.length * C.TILE_ENTRY_SIZE;
-    for (const t of this._tiles) size += t.data.length;
-    for (const c of this._commands) size += 4 + c.payload.length;
-    size += 4; // CRC32
+    for (const t of this._tiles) size += t.data.length;       // 瓦片二进制数据
+    for (const c of this._commands) size += 4 + c.payload.length; // 4字节=opcode(1)+payLen(3)
+    size += 4; // CRC32 校验和
 
     if (size > C.Limits.MAX_BYTES_PER_FRAME) {
       throw new Error(`Encoded frame ${size} exceeds MAX_BYTES_PER_FRAME`);
     }
 
     const buf = new Uint8Array(size);
-    const dv = new DataView(buf.buffer);
+    const dv = new DataView(buf.buffer);  // DataView 用于多字节整数写入 (统一小端)
     let off = 0;
 
-    // Header
-    buf[off++] = this._version;
-    buf[off++] = 0; // flags (reserved)
-    dv.setUint32(off, this._frameId, true); off += 4;
-    dv.setBigInt64(off, BigInt(this._timestamp), true); off += 8;
-    dv.setInt32(off, this._scrollX, true); off += 4;
-    dv.setInt32(off, this._scrollY, true); off += 4;
-    dv.setUint16(off, this._viewportW, true); off += 2;
-    dv.setUint16(off, this._viewportH, true); off += 2;
-    dv.setUint16(off, this._canvasW, true); off += 2;
-    dv.setUint16(off, this._canvasH, true); off += 2;
-    // off should be 30 (FRAME_HEADER_SIZE)
+    // ── 第二步: 写入帧头 (30 字节) ──
+    buf[off++] = this._version;                              // offset 0: 协议版本
+    buf[off++] = 0;                                          // offset 1: flags (预留，未来扩展)
+    dv.setUint32(off, this._frameId, true);    off += 4;    // offset 2-5: 帧序号 (uint32 LE)
+    dv.setBigInt64(off, BigInt(this._timestamp), true); off += 8; // offset 6-13: 时间戳 (int64 LE)
+    dv.setInt32(off, this._scrollX, true);     off += 4;    // offset 14-17: 水平滚动偏移
+    dv.setInt32(off, this._scrollY, true);     off += 4;    // offset 18-21: 垂直滚动偏移
+    dv.setUint16(off, this._viewportW, true);  off += 2;    // offset 22-23: 视口宽度
+    dv.setUint16(off, this._viewportH, true);  off += 2;    // offset 24-25: 视口高度
+    dv.setUint16(off, this._canvasW, true);    off += 2;    // offset 26-27: 画布宽度 (WebGL 可能 > viewport)
+    dv.setUint16(off, this._canvasH, true);    off += 2;    // offset 28-29: 画布高度
 
-    // Tile count + Tile entries
-    dv.setUint16(off, this._tiles.length, true); off += 2;
-    const tileDataStart = off + this._tiles.length * C.TILE_ENTRY_SIZE;
+    // ── 第三步: 瓦片条目表 (tileCount + N×TileEntry) ──
+    // TileEntry 格式: [x:2][y:2][w:2][h:2][encoding:2][dataLen:4] = 14 字节
+    dv.setUint16(off, this._tiles.length, true); off += 2;   // 瓦片数量
+    const tileDataStart = off + this._tiles.length * C.TILE_ENTRY_SIZE; // 瓦片数据区起始偏移
 
     for (const t of this._tiles) {
-      dv.setUint16(off, t.x, true); off += 2;
-      dv.setUint16(off, t.y, true); off += 2;
-      dv.setUint16(off, t.w, true); off += 2;
-      dv.setUint16(off, t.h, true); off += 2;
-      dv.setUint16(off, t.encoding, true); off += 2;
-      dv.setUint32(off, t.data.length, true); off += 4;
+      dv.setUint16(off, t.x, true);        off += 2;          // 瓦片 X 坐标 (像素)
+      dv.setUint16(off, t.y, true);        off += 2;          // 瓦片 Y 坐标 (像素)
+      dv.setUint16(off, t.w, true);        off += 2;          // 瓦片宽度 (通常 16)
+      dv.setUint16(off, t.h, true);        off += 2;          // 瓦片高度 (通常 16)
+      dv.setUint16(off, t.encoding, true); off += 2;          // 编码类型 (JPEG=1/PNG=2)
+      dv.setUint32(off, t.data.length, true); off += 4;       // 瓦片数据字节数
     }
-    // off should equal tileDataStart
 
-    // Tile data
+    // ── 第四步: 瓦片二进制数据 ──
+    // 直接拷贝原始 JPEG/PNG 字节，不做二次编码
     for (const t of this._tiles) {
       buf.set(t.data, off);
       off += t.data.length;
     }
 
-    // Commands
+    // ── 第五步: 命令流 ──
+    // 命令格式: [opcode:1][payLen:3][payload:payLen]
+    // payLen 使用 3 字节 big-endian (24-bit)，最大 16MB→实际限制 1MB
     for (const cmd of this._commands) {
-      buf[off++] = cmd.opcode;
+      buf[off++] = cmd.opcode;                              // 操作码
       const payLen = cmd.payload.length;
-      buf[off++] = (payLen >> 16) & 0xFF;
-      buf[off++] = (payLen >> 8) & 0xFF;
-      buf[off++] = payLen & 0xFF;
-      buf.set(cmd.payload, off);
+      buf[off++] = (payLen >> 16) & 0xFF;                   // payload 长度高字节
+      buf[off++] = (payLen >> 8) & 0xFF;                    // payload 长度中字节
+      buf[off++] = payLen & 0xFF;                           // payload 长度低字节
+      buf.set(cmd.payload, off);                            // payload 二进制数据
       off += payLen;
     }
 
-    // CRC32 (over everything except the CRC field itself)
+    // ── 第六步: CRC32 校验和 ──
+    // 校验范围: buf[0..off-1]，即 CRC 字段自身之前的所有数据
+    // 使用 IEEE 802.3 标准 CRC32 多项式，小端写入
     const crc = crc32(buf, 0, off);
     dv.setUint32(off, crc, true);
     off += 4;
 
+    // 返回 ArrayBuffer (slice 是为了确保精确长度，buf 可能预分配更大)
     return buf.buffer.slice(0, off);
   }
 

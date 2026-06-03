@@ -8,6 +8,27 @@
 'use strict';
 
 class Renderer {
+  // ════════════════════════════════════════════════════════════
+  // 客户端渲染器 —— 帧解码 + 命令校验 + CanvasKit 渲染
+  //
+  // 渲染管道 (每帧):
+  //   1. CRC32 完整性校验 → 不通过则拒绝
+  //   2. FrameDecoder.decode() → 解析帧结构
+  //   3. CommandValidator.scan(cmdView) → 白名单+深度+边界检查
+  //   4. _renderTiles() → JPEG 解码 → drawImage 到 SkCanvas
+  //   5. _dispatchCommands() → 逐个命令发送到 CanvasKit API
+  //
+  // 安全层:
+  //   - CRC32: 防止传输损坏/中间人篡改
+  //   - Validator: 防止恶意命令执行 (白名单+参数限制)
+  //   - rejectionCount: 连续 N 帧校验失败 → request_keyframe
+  //
+  // CanvasKit 初始化:
+  //   - WebGL Canvas (GPU 加速) → MakeWebGLCanvasSurface()
+  //   - 降级: 软件渲染 → MakeSWCanvasSurface()
+  //   - 全部失败 → _skCanvas=null → 所有帧返回 {rendered:false}
+  // ════════════════════════════════════════════════════════════
+
   /**
    * @param {HTMLCanvasElement} canvas
    * @param {object} canvasKit - CanvasKit WASM 实例

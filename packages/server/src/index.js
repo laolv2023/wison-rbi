@@ -9,6 +9,19 @@
  */
 
 'use strict';
+// ════════════════════════════════════════════════════════════
+// 服务端入口 —— HTTP + WebSocket 双协议服务器
+//
+// 职责:
+//   1. 静态文件服务 (client/ + protocol/ 目录)
+//   2. WebSocket 服务 (帧推送 + HID 接收 + 控制消息)
+//   3. 健康检查端点 (/health) + Prometheus 指标 (/metrics)
+//   4. 优雅关闭 (SIGTERM/SIGINT → 清理所有会话 → 退出)
+//
+// 启动:  node index.js
+// 配置:  环境变量 (WISON_PORT, WISON_AUTH_TOKEN 等)
+// ════════════════════════════════════════════════════════════
+
 
 const http = require('http');
 const fs = require('fs');

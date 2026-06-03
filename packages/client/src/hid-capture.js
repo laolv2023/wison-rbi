@@ -19,6 +19,24 @@ const HID_TYPE = {
 };
 
 class HIDCapture {
+  // ════════════════════════════════════════════════════════════
+  // HID 事件捕获 —— 浏览器原生事件 → 二进制 HID 消息
+  //
+  // 监听事件:
+  //   mousemove/mousedown/mouseup/wheel → 鼠标事件 (0x10-0x13)
+  //   keydown/keyup → 键盘事件 (0x14-0x15)
+  //   touchstart/touchmove/touchend → 触屏事件 (0x16-0x18)
+  //   paste → 文本注入 (0x20)
+  //
+  // 坐标变换:
+  //   _canvasToViewport(e) → 浏览器 pageX/Y → 画布内坐标
+  //   考虑 devicePixelRatio 和 canvas.clientWidth/clientHeight
+  //
+  // HID 消息格式: [type:1][JSON_payload:N]
+  // payload 包含: {x,y,button,modifiers,frame_id}
+  // frame_id 用于服务端关联当前显示帧 (为未来 scroll 补偿保留)
+  // ════════════════════════════════════════════════════════════
+
   /**
    * @param {HTMLCanvasElement} canvas
    * @param {object} options
