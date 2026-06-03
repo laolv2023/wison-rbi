@@ -10,6 +10,7 @@
 
 'use strict';
 
+const crypto = require('crypto');
 const { WebSocketServer, WebSocket } = require('ws');
 const { Session } = require('./session');
 const config = require('./config');
@@ -25,6 +26,7 @@ class WsServer {
     this._sessions = new Map();     // sessionId → Session
     this._ipConnections = new Map(); // ip → count
     this._heartbeats = new Map();   // sessionId → lastPing
+    this._cleanedSessions = new Set(); // v1.7: 防 _cleanupSession 重复调用
 
     this._wss = new WebSocketServer({
       server: httpServer,
@@ -104,6 +106,15 @@ class WsServer {
     ws.on('message', (data, isBinary) => {
       this._heartbeats.set(sessionId, Date.now());
 
+      // v1.7: 非认证消息在认证完成前一律拒绝
+      if (!session._authenticated && config.authToken) {
+        if (!isBinary && data.toString().startsWith('{"type":"auth"')) {
+          // 允许 auth 消息通过
+        } else {
+          return; // 拒绝
+        }
+      }
+
       if (isBinary) {
         // HID 事件
         session.injectHID(data).catch(err =>
@@ -133,9 +144,28 @@ class WsServer {
   /** 处理控制消息 */
   async _handleControl(session, msg) {
     switch (msg.type) {
+      case 'auth':  // v1.7: 浏览器 WebSocket 无法发送 HTTP 头，通过首个消息认证
+        if (!config.authToken) { session._authenticated = true; break; }
+        const bufA = Buffer.from(msg.token || '');
+        const bufB = Buffer.from(config.authToken);
+        if (bufA.length === bufB.length && crypto.timingSafeEqual(bufA, bufB)) {
+          session._authenticated = true;
+        } else {
+          this._log.warn({ sessionId: session.id }, 'Auth token rejected');
+          this._closeSession(session.id);
+        }
+        break;
       case 'start':
       case 'navigate':
+        // v1.7: URL scheme 校验（仅允许 http/https）
         if (msg.url) {
+          let parsed;
+          try { parsed = new URL(msg.url); } catch (_) { return; }
+          if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+            this._log.warn({ url: msg.url }, 'Blocked non-HTTP(S) URL');
+            session._notifyStatus({ error: 'NAVIGATION_FAILED', message: 'Only http/https allowed' });
+            return;
+          }
           await session.start(msg.url).catch(err =>
             this._log.error({ err }, 'Session start/navigate failed')
           );
@@ -152,9 +182,8 @@ class WsServer {
         }
         break;
       case 'request_keyframe':
-        // v1.6: 客户端检测到连续验证失败，请求强制 Keyframe
-        this._log.warn({ sessionId: session.id }, 'Client requested keyframe');
-        // 下一个帧循环自然产生 Keyframe（frameCount 重置在 navigate 中）
+        // v1.7: 强制下一帧为全量 Keyframe
+        session.forceKeyframe();
         break;
       case 'ping':
         // 心跳请求——等待 pong 响应在 ws 层自动处理
@@ -176,7 +205,9 @@ class WsServer {
           this._log.trace({ sessionId, buffered: ws.bufferedAmount }, 'Backpressure, skipping frame');
           return;
         }
-        ws.send(arrayBuffer, { binary: true });
+        ws.send(arrayBuffer, { binary: true }, (err) => {
+          if (err) this._log.warn({ err: err.message, sessionId }, 'Frame send failed');
+        });
         return;
       }
     }
@@ -186,14 +217,26 @@ class WsServer {
   _sendStatus(sessionId, msg) {
     for (const ws of this._wss.clients) {
       if (ws._wisonSessionId === sessionId && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify(msg));
+        ws.send(JSON.stringify(msg), (err) => {
+          if (err) this._log.warn({ err: err.message, sessionId }, 'Status send failed');
+        });
         return;
       }
     }
   }
 
-  /** 清理会话 */
+  /** v1.7: 主动关闭指定会话 */
+  _closeSession(sessionId) {
+    for (const ws of this._wss.clients) {
+      if (ws._wisonSessionId === sessionId) {
+        ws.close(4001, 'Auth failed');
+        return;
+      }
+    }
+  }
   _cleanupSession(sessionId, ip) {
+    if (this._cleanedSessions.has(sessionId)) return;  // v1.7: 防重入
+    this._cleanedSessions.add(sessionId);
     const session = this._sessions.get(sessionId);
     if (session) {
       session.destroy().catch(() => {});
@@ -220,44 +263,8 @@ class WsServer {
         // 关闭关联的 WebSocket
         for (const ws of this._wss.clients) {
           if (ws._wisonSessionId === sessionId) {
-            ws.terminate();
+            ws.close(1001, 'Heartbeat timeout');  // v1.7: 使用 close 而非 terminate
             break;
-          }
-        }
-        this._sessions.get(sessionId)?.destroy().catch(() => {});
-        this._sessions.delete(sessionId);
-        this._heartbeats.delete(sessionId);
-      }
-    }
-  }
-
-  /** 空闲会话回收 */
-  _reapIdleSessions() {
-    for (const [sessionId, session] of this._sessions) {
-      if (session.isIdle()) {
-        this._log.info({ sessionId }, 'Reaping idle session');
-        for (const ws of this._wss.clients) {
-          if (ws._wisonSessionId === sessionId) {
-            ws.close(1000, 'Idle timeout');
-            break;
-          }
-        }
-        session.destroy().catch(() => {});
-        this._sessions.delete(sessionId);
-        this._heartbeats.delete(sessionId);
-      }
-    }
-  }
-
-  /** 优雅关闭 */
-  async shutdown() {
-    clearInterval(this._heartbeatTimer);
-    clearInterval(this._idleTimer);
-
-    // 关闭所有连接
-    for (const ws of this._wss.clients) {
-      ws.close(1001, 'Server shutting down');
-    }
 
     // 销毁所有会话
     const promises = [];

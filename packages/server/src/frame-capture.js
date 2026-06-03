@@ -8,6 +8,7 @@
 'use strict';
 
 const crypto = require('crypto');
+const sharp = require('sharp');  // v1.7: 移至模块顶层，首次加载失败即 fast-fail
 const { TileEncoding } = require('../../protocol/src/constants');
 
 class FrameCapture {
@@ -32,6 +33,7 @@ class FrameCapture {
     this._frameCount = 0;
     this._consecutiveFailures = 0;
     this._maxConsecutiveFailures = 10;
+    this._forceNextKeyframe = false;  // v1.7
   }
 
   /**
@@ -39,47 +41,52 @@ class FrameCapture {
    * 抛出异常时由调用方处理。
    */
   async capture() {
-    // 截图 (JPEG quality 70 — 平衡质量与带宽)
-    const screenshot = await this._page.screenshot({
-      type: 'jpeg',
-      quality: 70,
+    // v1.7: 截图使用 PNG（无损，支持逐 tile 像素哈希）
+    const screenshotPng = await this._page.screenshot({
+      type: 'png',
       fullPage: false,
     });
 
     this._consecutiveFailures = 0;
 
-    // 计算脏 tile 哈希
-    const dirtyList = this._computeDirtyTiles(screenshot);
+    // 解码为 raw RGBA pixels
+    const { data: rawPixels, info: { width, height } } = await sharp(screenshotPng)
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+
+    // 计算脏 tile 列表（基于 raw pixel hash）
+    const dirtyList = this._computeDirtyTiles(rawPixels, width);
     this._frameCount++;
 
-    if (dirtyList.length === 0) return null; // 无变化
+    if (dirtyList.length === 0) return null;
 
-    // 决定帧类型
-    const isKeyframe = dirtyList.length > this._totalTiles * 0.5 ||
+    const isKeyframe = this._forceNextKeyframe ||
+      dirtyList.length > this._totalTiles * 0.5 ||
       this._frameCount % this._keyframeInterval === 0;
 
+    if (this._forceNextKeyframe) this._forceNextKeyframe = false;
+
     if (isKeyframe) {
-      // 全量帧: 整张截图作为一个 tile
-      this._updateAllHashes(screenshot);
+      // Keyframe: 整帧 JPEG（带宽优于 PNG）
+      const screenshotJpeg = await this._page.screenshot({
+        type: 'jpeg', quality: 70, fullPage: false,
+      });
+      this._updateAllHashes(rawPixels, width);
       return {
-        frameType: 0x01, // KEYFRAME
+        frameType: 0x01,
         tiles: [{
           x: 0, y: 0,
           w: this._viewport.width, h: this._viewport.height,
           encoding: TileEncoding.JPEG,
-          data: screenshot,
+          data: screenshotJpeg,
         }],
       };
     }
 
-    // 增量帧: 裁剪脏 tile 并编码
-    const { default: sharp } = await import('sharp');
-    const img = sharp(screenshot);
+    // Diff: 从 PNG 裁剪脏 tile → JPEG 编码
     const tiles = [];
-
     for (const { x, y } of dirtyList) {
-      const tileBuf = await img
-        .clone()
+      const tileBuf = await sharp(screenshotPng)
         .extract({ left: x, top: y, width: this._tileSize, height: this._tileSize })
         .jpeg({ quality: 60 })
         .toBuffer();
@@ -90,39 +97,55 @@ class FrameCapture {
         data: tileBuf,
       });
     }
-
-    return { frameType: 0x02, tiles }; // DIFF
+    return { frameType: 0x02, tiles };
   }
 
-  /** 计算脏 tile 列表（MD5 对比） */
-  _computeDirtyTiles(screenshotBuf) {
+  /** v1.7: 基于 raw pixel 的逐 tile 哈希对比 */
+  _computeDirtyTiles(rawPixels, imgWidth) {
     const dirty = [];
-    // 用 sharp 逐 tile 计算 MD5
-    // 简化：对整个截图分 tile 计算
     const hash = (buf) => crypto.createHash('md5').update(buf).digest('hex');
+    const bytesPerPixel = 4; // RGBA
 
-    // 将截图转为 pixel buffer 按 tile 分块
-    // 实践中 sharp 的 extract 更高效，这里用 hash 分块对比
-    const imgHash = hash(screenshotBuf);
-    for (let i = 0; i < this._totalTiles; i++) {
-      // 简化实现：使用整帧 hash + tile 索引作为 tile key
-      // 完整实现应逐 tile hash
-      const tileId = `${imgHash}:${i}`;
-      if (tileId !== this._prevHashes[i]) {
-        const row = Math.floor(i / this._cols);
-        const col = i % this._cols;
-        dirty.push({ x: col * this._tileSize, y: row * this._tileSize });
-        this._prevHashes[i] = tileId;
+    for (let tileIdx = 0; tileIdx < this._totalTiles; tileIdx++) {
+      const row = Math.floor(tileIdx / this._cols);
+      const col = tileIdx % this._cols;
+      const tileX = col * this._tileSize;
+      const tileY = row * this._tileSize;
+
+      // 提取 tile 区域的像素行
+      const tileBytes = Buffer.allocUnsafe(this._tileSize * this._tileSize * bytesPerPixel);
+      for (let py = 0; py < this._tileSize && (tileY + py) < imgWidth/*height*/; py++) {
+        const srcOff = ((tileY + py) * imgWidth + tileX) * bytesPerPixel;
+        const dstOff = py * this._tileSize * bytesPerPixel;
+        const lineLen = Math.min(this._tileSize, imgWidth - tileX) * bytesPerPixel;
+        rawPixels.copy(tileBytes, dstOff, srcOff, srcOff + lineLen);
+      }
+
+      const tileHash = hash(tileBytes);
+      if (tileHash !== this._prevHashes[tileIdx]) {
+        dirty.push({ x: tileX, y: tileY });
+        this._prevHashes[tileIdx] = tileHash;
       }
     }
     return dirty;
   }
 
-  _updateAllHashes(screenshotBuf) {
+  _updateAllHashes(rawPixels, imgWidth) {
     const hash = (buf) => crypto.createHash('md5').update(buf).digest('hex');
-    const imgHash = hash(screenshotBuf);
-    for (let i = 0; i < this._totalTiles; i++) {
-      this._prevHashes[i] = `${imgHash}:${i}`;
+    const bytesPerPixel = 4;
+    for (let tileIdx = 0; tileIdx < this._totalTiles; tileIdx++) {
+      const row = Math.floor(tileIdx / this._cols);
+      const col = tileIdx % this._cols;
+      const tileX = col * this._tileSize;
+      const tileY = row * this._tileSize;
+      const tileBytes = Buffer.allocUnsafe(this._tileSize * this._tileSize * bytesPerPixel);
+      for (let py = 0; py < this._tileSize; py++) {
+        const srcOff = ((tileY + py) * imgWidth + tileX) * bytesPerPixel;
+        const dstOff = py * this._tileSize * bytesPerPixel;
+        const lineLen = Math.min(this._tileSize, imgWidth - tileX) * bytesPerPixel;
+        rawPixels.copy(tileBytes, dstOff, srcOff, srcOff + lineLen);
+      }
+      this._prevHashes[tileIdx] = hash(tileBytes);
     }
   }
 
@@ -135,6 +158,11 @@ class FrameCapture {
   /** 标记页面导航 → 强制下一帧为 Keyframe */
   markNavigation() {
     this._frameCount = 0;
+  }
+
+  /** v1.7: 外部强制 Keyframe（客户端 request_keyframe） */
+  forceKeyframe() {
+    this._forceNextKeyframe = true;
   }
 
   /** 更新视口尺寸（resize 后调用） */

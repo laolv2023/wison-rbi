@@ -53,6 +53,7 @@ class HIDCapture {
   /** Canvas 坐标 → Viewport 坐标。 */
   _canvasToViewport(e) {
     const rect = this._canvas.getBoundingClientRect();
+    if (!rect.width || !rect.height) return { x: 0, y: 0 }; // v1.7: 防 NaN
     return {
       x: Math.round((e.clientX - rect.left) * (this._viewport.width / rect.width)),
       y: Math.round((e.clientY - rect.top) * (this._viewport.height / rect.height)),

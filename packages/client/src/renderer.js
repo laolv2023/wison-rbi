@@ -58,9 +58,21 @@ class Renderer {
       // Step 1: 解码
       const decoded = this._decoder.decode(frameData);
 
-      // Step 2: 校验 (安全边界)
-      // 从帧中提取命令流部分进行校验
-      const cmdView = new Uint8Array(frameData, 30 + 2 + decoded.tileCount * 14);
+      // Step 2: CRC32 完整性校验 (v1.7)
+      if (!FrameDecoder.verifyCRC32(
+        frameData instanceof Uint8Array ? frameData : new Uint8Array(frameData)
+      )) {
+        console.warn('[wison] Frame CRC32 mismatch');
+        return { rendered: false, reason: 'CRC32 mismatch' };
+      }
+
+      // Step 3: 校验 (安全边界)
+      // 从帧中提取命令流部分（使用 decoder 提供的精确偏移）
+      const cmdView = new Uint8Array(
+        frameData,
+        decoded.commandOffset,
+        frameData.byteLength - decoded.commandOffset - 4 // 减去 CRC32
+      );
       const result = this._validator.scan(cmdView);
 
       if (!result.valid) {

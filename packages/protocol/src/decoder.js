@@ -10,6 +10,17 @@
 const isNode = typeof module !== 'undefined' && module.exports;
 const C = isNode ? require('./constants') : window.WisonProtocol;
 
+// CRC32 查找表 (IEEE 802.3)
+const CRC32_TABLE = (() => {
+  const table = new Int32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let crc = i;
+    for (let j = 0; j < 8; j++) crc = crc & 1 ? (crc >>> 1) ^ 0xEDB88320 : crc >>> 1;
+    table[i] = crc;
+  }
+  return table;
+})();
+
 class DecodeError extends Error {
   constructor(message, offset) {
     super(message);
@@ -141,6 +152,7 @@ class FrameDecoder {
       tiles,
       data, // reference to raw buffer for lazy tile/command extraction
       commands,
+      commandOffset: cmdStart,  // v1.7: 命令流起始偏移
       crcReceived,
     };
   }
@@ -152,11 +164,10 @@ class FrameDecoder {
   extractCommandPayload(decodedFrame, cmdIndex) {
     const cmd = decodedFrame.commands[cmdIndex];
     if (!cmd) throw new DecodeError(`Command index ${cmdIndex} out of range`, -1);
-    return new Uint8Array(
-      decodedFrame.data.buffer,
-      decodedFrame.data.byteOffset + cmd.payloadOffset,
-      cmd.payloadSize
-    );
+    // v1.7: 复制 payload 而非创建大 buffer 视图，释放原始帧 buffer 供 GC
+    const start = decodedFrame.data.byteOffset + cmd.payloadOffset;
+    const end = start + cmd.payloadSize;
+    return new Uint8Array(decodedFrame.data.buffer.slice(start, end));
   }
 
   /**
@@ -170,6 +181,24 @@ class FrameDecoder {
       decodedFrame.data.byteOffset + tile.dataOffset,
       tile.dataLen
     );
+  }
+
+  /**
+   * v1.7: 验证帧 CRC32 完整性。
+   * 对 data[0..data.length-4] 计算 CRC32 并与最后 4 字节比较。
+   * @returns {boolean}
+   */
+  static verifyCRC32(data) {
+    const buf = data instanceof Uint8Array ? data : new Uint8Array(data);
+    if (buf.length < 4) return false;
+    let crc = 0xFFFFFFFF;
+    for (let i = 0; i < buf.length - 4; i++) {
+      crc = CRC32_TABLE[(crc ^ buf[i]) & 0xFF] ^ (crc >>> 8);
+    }
+    const expected = (crc ^ 0xFFFFFFFF) >>> 0;
+    const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+    const received = dv.getUint32(buf.length - 4, true);
+    return expected === received;
   }
 }
 

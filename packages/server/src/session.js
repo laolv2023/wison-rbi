@@ -45,7 +45,8 @@ class Session {
 
     // 帧循环
     this._frameLoop = null;
-    this._frameSeq = 0; // v1.6: compositor frame sequence counter
+    this._frameSeq = 0;
+    this._capturing = false;  // v1.7: 帧循环互斥锁
 
     // 统计
     this._createdAt = Date.now();
@@ -176,6 +177,11 @@ class Session {
     return Date.now() - this._lastActivity > config.sessionIdleTimeoutMs;
   }
 
+  /** v1.7: 强制下一帧为 Keyframe（客户端 request_keyframe） */
+  forceKeyframe() {
+    if (this._capture) this._capture.forceKeyframe();
+  }
+
   // ── 帧循环 ───────────────────────────────────────────
 
   async _runFrameLoop() {
@@ -193,7 +199,12 @@ class Session {
   }
 
   async _captureFrame() {
+    if (!this._running) return;  // v1.7: destroy 竞态保护
+    if (this._capturing) return; // v1.7: 防止帧循环重叠
     if (!this._capture || !this._encoder) return;
+
+    this._capturing = true;
+    try {
 
     const result = await this._capture.capture();
     if (!result) return; // 无变化
@@ -227,6 +238,9 @@ class Session {
     this._onFrame(this.id, frame);
     this._framesSent++;
     this._bytesSent += frame.byteLength;
+    } finally {
+      this._capturing = false;  // v1.7: 释放互斥锁
+    }
   }
 
   // ── 内部 ─────────────────────────────────────────────

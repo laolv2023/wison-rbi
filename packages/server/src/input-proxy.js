@@ -35,6 +35,8 @@ class InputProxy {
     const view = new DataView(data);
     const type = view.getUint8(0);
     const payload = JSON.parse(new TextDecoder().decode(new Uint8Array(data, 1)));
+    // v1.7: 运行时字段校验
+    if (!payload || typeof payload !== 'object') return;
 
     try {
       switch (type) {
