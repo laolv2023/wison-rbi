@@ -11,8 +11,13 @@
 'use strict';
 
 const http = require('http');
+const fs = require('fs');
+const path = require('path');
 const { WsServer } = require('./ws-server');
 const config = require('./config');
+
+// 静态文件根目录: packages/ 目录 (server 同级)
+const STATIC_ROOT = path.resolve(__dirname, '../../');
 
 // ── 日志 ────────────────────────────────────────────────
 let logger;
@@ -82,6 +87,25 @@ function requestListener(req, res) {
     res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4' });
     res.end(lines.join('\n') + '\n');
     return;
+  }
+
+  // 静态文件: / → client/index.html, /client/... /protocol/...
+  if (req.method === 'GET') {
+    let filePath = url.pathname === '/' ? '/client/index.html' : url.pathname;
+    // 安全检查: 防止路径穿越
+    if (filePath.includes('..')) {
+      res.writeHead(403); res.end('Forbidden'); return;
+    }
+    const fullPath = path.join(STATIC_ROOT, filePath);
+    const mimeTypes = { '.html':'text/html','.js':'application/javascript','.wasm':'application/wasm','.css':'text/css','.json':'application/json','.png':'image/png' };
+    const ext = path.extname(fullPath);
+    const contentType = mimeTypes[ext] || 'application/octet-stream';
+    try {
+      const content = fs.readFileSync(fullPath);
+      res.writeHead(200, { 'Content-Type': contentType, 'Content-Length': content.length });
+      res.end(content);
+      return;
+    } catch (_) { /* fall through to 404 */ }
   }
 
   // 404

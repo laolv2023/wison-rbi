@@ -1,0 +1,34 @@
+# Wison-RBI — 生产部署
+#
+# 一键启动:
+#   docker compose up --build
+#
+# 访问: http://容器IP:8080
+
+version: "3.9"
+
+services:
+  wison:
+    build: .
+    container_name: wison-rbi
+    ports:
+      - "${WISON_PORT:-8080}:8080"
+    environment:
+      - NODE_ENV=production
+      - WISON_PORT=8080
+      - WISON_AUTH_TOKEN=${WISON_AUTH_TOKEN:-}
+      - WISON_MAX_SESSIONS=${WISON_MAX_SESSIONS:-5}
+      - WISON_LOG_LEVEL=${WISON_LOG_LEVEL:-info}
+    shm_size: "2gb"
+    security_opt:
+      - seccomp:unconfined
+    deploy:
+      resources:
+        limits:
+          memory: 4g
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"

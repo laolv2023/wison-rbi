@@ -135,47 +135,132 @@ class Renderer {
 
   _dispatch(opcode, payload) {
     const ck = this._ck;
-    const canvas = this._skCanvas;
-    const dv = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+    const c = this._skCanvas;
+    const d = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+    let p, off, verbCount, ptCount, verbs, pts, path, count, i;
 
     switch (opcode) {
-      case 0x01: canvas.save(); break;
-      case 0x02: canvas.restore(); break;
-      case 0x03: canvas.saveLayer(null, null); break; // simplified
-
-      case 0x10: { // concat
-        const m = new Float32Array(payload.buffer, payload.byteOffset, 9);
-        canvas.concat(m); break;
-      }
-      case 0x11: canvas.translate(dv.getFloat32(0, true), dv.getFloat32(4, true)); break;
-      case 0x12: canvas.scale(dv.getFloat32(0, true), dv.getFloat32(4, true)); break;
-      case 0x13: canvas.rotate(dv.getFloat32(0, true)); break;
-
-      case 0x30: { // drawRect
-        const p = new ck.Paint();
-        p.setColor([dv.getUint8(16)/255, dv.getUint8(17)/255, dv.getUint8(18)/255, dv.getUint8(19)/255]);
-        canvas.drawRect([dv.getFloat32(0, true), dv.getFloat32(4, true), dv.getFloat32(8, true), dv.getFloat32(12, true)], p);
+      // ── State (0x01-0x0F) ──
+      case 0x01: c.save(); break;
+      case 0x02: c.restore(); break;
+      case 0x03: // saveLayer(bounds, paint, flags)
+        p = new ck.Paint();
+        const b = [d.getFloat32(0,true), d.getFloat32(4,true), d.getFloat32(8,true), d.getFloat32(12,true)];
+        const f = d.getUint32(16, true);
+        c.saveLayer(p, b, null, f);
         p.delete(); break;
-      }
 
-      case 0x34: { // drawPath
-        const verbCount = dv.getUint32(0, true);
-        const verbs = new Uint8Array(payload.buffer, payload.byteOffset + 4, verbCount);
-        const ptCount = dv.getUint32(4 + verbCount, true);
-        const pts = new Float32Array(payload.buffer, payload.byteOffset + 8 + verbCount, ptCount * 2);
-        const path = ck.Path.MakeFromVerbsPointsWeights(verbs, pts, null);
-        const p = new ck.Paint();
-        const po = 8 + verbCount + ptCount * 8;
-        p.setColor([dv.getUint8(po)/255, dv.getUint8(po+1)/255, dv.getUint8(po+2)/255, dv.getUint8(po+3)/255]);
-        canvas.drawPath(path, p);
+      // ── Transform (0x10-0x1F) ──
+      case 0x10: c.concat(new Float32Array(payload.buffer, payload.byteOffset, 9)); break;
+      case 0x11: c.translate(d.getFloat32(0,true), d.getFloat32(4,true)); break;
+      case 0x12: c.scale(d.getFloat32(0,true), d.getFloat32(4,true)); break;
+      case 0x13: c.rotate(d.getFloat32(0,true)); break;
+
+      // ── Clip (0x20-0x2F) ──
+      case 0x20: // clipRect(rect, op, aa)
+        c.clipRect([d.getFloat32(0,true), d.getFloat32(4,true), d.getFloat32(8,true), d.getFloat32(12,true)], d.getUint8(16), !!d.getUint8(17)); break;
+      case 0x21: // clipRRect(rrect, op, aa) — simplified as rect clip
+        c.clipRect([d.getFloat32(0,true), d.getFloat32(4,true), d.getFloat32(8,true), d.getFloat32(12,true)], d.getUint8(16), !!d.getUint8(17)); break;
+      case 0x22: // clipPath(path, op, aa)
+        verbCount = d.getUint32(0, true);
+        verbs = new Uint8Array(payload.buffer, payload.byteOffset + 4, verbCount);
+        ptCount = d.getUint32(4 + verbCount, true);
+        pts = new Float32Array(payload.buffer, payload.byteOffset + 8 + verbCount, ptCount * 2);
+        path = ck.Path.MakeFromVerbsPointsWeights(verbs, pts, null);
+        off = 8 + verbCount + ptCount * 8;
+        c.clipPath(path, d.getUint8(off), !!d.getUint8(off + 1));
+        path.delete(); break;
+
+      // ── Shapes (0x30-0x3F) ──
+      case 0x30: // drawRect
+        p = new ck.Paint(); this._readPaintColor(p, d, 16);
+        c.drawRect([d.getFloat32(0,true), d.getFloat32(4,true), d.getFloat32(8,true), d.getFloat32(12,true)], p);
+        p.delete(); break;
+      case 0x31: // drawRRect — fallback to drawRect
+        p = new ck.Paint(); this._readPaintColor(p, d, 20);
+        c.drawRect([d.getFloat32(0,true), d.getFloat32(4,true), d.getFloat32(8,true), d.getFloat32(12,true)], p);
+        p.delete(); break;
+      case 0x32: // drawOval
+        p = new ck.Paint(); this._readPaintColor(p, d, 16);
+        c.drawOval([d.getFloat32(0,true), d.getFloat32(4,true), d.getFloat32(8,true), d.getFloat32(12,true)], p);
+        p.delete(); break;
+      case 0x33: // drawArc(oval, startAngle, sweepAngle, useCenter, paint)
+        p = new ck.Paint(); this._readPaintColor(p, d, 25);
+        c.drawArc([d.getFloat32(0,true), d.getFloat32(4,true), d.getFloat32(8,true), d.getFloat32(12,true)], d.getFloat32(16,true), d.getFloat32(20,true), !!d.getUint8(24), p);
+        p.delete(); break;
+      case 0x34: // drawPath
+        verbCount = d.getUint32(0, true);
+        verbs = new Uint8Array(payload.buffer, payload.byteOffset + 4, verbCount);
+        ptCount = d.getUint32(4 + verbCount, true);
+        pts = new Float32Array(payload.buffer, payload.byteOffset + 8 + verbCount, ptCount * 2);
+        path = ck.Path.MakeFromVerbsPointsWeights(verbs, pts, null);
+        p = new ck.Paint(); this._readPaintColor(p, d, 8 + verbCount + ptCount * 8);
+        c.drawPath(path, p);
         path.delete(); p.delete(); break;
-      }
+      case 0x35: // drawPoints(mode, count, pts, paint) — simplified: skip for now
+        break;
+      case 0x36: // drawShadow(path, zParams, lightPos, radius, ambient, spot, flags)
+        verbCount = d.getUint32(0, true);
+        verbs = new Uint8Array(payload.buffer, payload.byteOffset + 4, verbCount);
+        ptCount = d.getUint32(4 + verbCount, true);
+        pts = new Float32Array(payload.buffer, payload.byteOffset + 8 + verbCount, ptCount * 2);
+        path = ck.Path.MakeFromVerbsPointsWeights(verbs, pts, null);
+        off = 8 + verbCount + ptCount * 8;
+        c.drawShadow(path, [d.getFloat32(off,true), d.getFloat32(off+4,true), d.getFloat32(off+8,true)], [d.getFloat32(off+12,true), d.getFloat32(off+16,true), d.getFloat32(off+20,true)], d.getFloat32(off+24,true), d.getUint32(off+28,true), d.getUint32(off+32,true), d.getUint32(off+36,true));
+        path.delete(); break;
 
-      // 其他 opcode 的 CanvasKit 映射在此处扩展
-      // (drawImage, drawTextBlob, drawShadow 等)
-      default:
-        console.debug(`[wison] Unimplemented opcode: 0x${opcode.toString(16)}`);
+      // ── Images (0x40-0x4F) ──
+      case 0x40: // drawImage(img, x, y, sampling, paint)
+        { const imgX = d.getFloat32(0,true), imgY = d.getFloat32(4,true);
+          const imgData = this._readImageData(payload, 8);
+          if (imgData) { p = new ck.Paint(); this._readPaintColor(p, d, 8 + imgData.bytesRead); c.drawImageOptions(imgData.img, imgX, imgY, ck.FilterMode.Linear, ck.MipmapMode.Linear, p); p.delete(); imgData.img.delete(); } }
+        break;
+      case 0x41: // drawImageRect(src, dst, sampling, constraint, img, paint)
+        { const imgData = this._readImageData(payload, 33);
+          if (imgData) { p = new ck.Paint(); this._readPaintColor(p, d, 33 + imgData.bytesRead); c.drawImageRectOptions(imgData.img, [d.getFloat32(0,true), d.getFloat32(4,true), d.getFloat32(8,true), d.getFloat32(12,true)], [d.getFloat32(16,true), d.getFloat32(20,true), d.getFloat32(24,true), d.getFloat32(28,true)], ck.FilterMode.Linear, ck.MipmapMode.Linear, p); p.delete(); imgData.img.delete(); } }
+        break;
+      case 0x42: // drawAtlas — simplified: skip complex atlas for now
+        break;
+
+      // ── Text (0x50-0x5F) ──
+      case 0x50: // drawTextBlob — simplified: draw placeholder rect
+        p = new ck.Paint(); p.setColor([0, 0, 0, 1]);
+        c.drawRect([d.getFloat32(0,true), d.getFloat32(4,true) - 12, d.getFloat32(0,true) + 100, d.getFloat32(4,true) + 4], p);
+        p.delete(); break;
+      case 0x51: // glyphRunList — same simplified placeholder
+        p = new ck.Paint(); p.setColor([0, 0, 0, 1]);
+        c.drawRect([0, 0, 100, 16], p);
+        p.delete(); break;
+
+      // ── Paint (0x60-0x6F) ──
+      case 0x60: // drawPaint
+        p = new ck.Paint(); this._readPaintColor(p, d, 0); c.drawPaint(p); p.delete(); break;
+      case 0x61: // drawColor(r,g,b,a, mode)
+        c.drawColor([d.getUint8(0)/255, d.getUint8(1)/255, d.getUint8(2)/255, d.getUint8(3)/255], d.getUint8(4)); break;
+
+      // ── Placeholder ──
+      case 0x7F: break; // SkDrawable placeholder — intentionally skipped
+
+      default: console.debug(`[wison] Unknown opcode: 0x${opcode.toString(16)}`);
     }
+  }
+
+  // ── Helpers ──
+
+  _readPaintColor(paint, dv, offset) {
+    paint.setColor([dv.getUint8(offset)/255, dv.getUint8(offset+1)/255, dv.getUint8(offset+2)/255, dv.getUint8(offset+3)/255]);
+  }
+
+  _readImageData(payload, offset) {
+    const d = new DataView(payload.buffer, payload.byteOffset + offset, payload.byteLength - offset);
+    const flag = d.getUint8(0);
+    if (flag === 0x00) { // inline
+      const size = d.getUint32(1, true);
+      const bytes = new Uint8Array(payload.buffer, payload.byteOffset + offset + 5, size);
+      const img = this._ck.MakeImageFromEncoded(bytes);
+      return img ? { img, bytesRead: 5 + size } : null;
+    }
+    return null; // hash-ref not implemented in phase 1
   }
 
   /** 请求服务端发送全量 Keyframe。 */

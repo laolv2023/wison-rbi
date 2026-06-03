@@ -1,0 +1,14 @@
+{
+  "name": "wison-rbi",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Compositor-layer browser isolation system",
+  "workspaces": ["packages/protocol", "packages/server"],
+  "scripts": {
+    "start": "npm -w packages/server start",
+    "test": "node --test packages/protocol/tests/*.test.js",
+    "lint": "echo lint ok"
+  },
+  "engines": { "node": ">=20.0.0" },
+  "license": "MIT"
+}
