@@ -92,6 +92,11 @@ class Renderer {
         frameData instanceof Uint8Array ? frameData : new Uint8Array(frameData)
       )) {
         console.warn('[wison] Frame CRC32 mismatch');
+        this._rejectionCount++;  // v1.14: CRC32 失败计入 rejection
+        if (this._rejectionCount >= this._maxRejections && this._onRequestKeyframe) {
+          this._onRequestKeyframe();
+          this._rejectionCount = 0;
+        }
         return { rendered: false, reason: 'CRC32 mismatch' };
       }
 
@@ -132,6 +137,11 @@ class Renderer {
       return { rendered: true, meta: decoded };
     } catch (err) {
       console.error('[wison] Render error:', err.message);
+      this._rejectionCount++;  // v1.14: decode 异常计入 rejection
+      if (this._rejectionCount >= this._maxRejections && this._onRequestKeyframe) {
+        this._onRequestKeyframe();
+        this._rejectionCount = 0;
+      }
       return { rendered: false, reason: err.message };
     }
   }

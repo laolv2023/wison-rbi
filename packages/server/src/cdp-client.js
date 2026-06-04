@@ -9,7 +9,7 @@
 
 const CDP = require('chrome-remote-interface');
 
-const CDP_TIMEOUT = 5000;
+const CDP_TIMEOUT = 10000;  // v1.14: 10s CDP 命令超时
 const MAX_RETRIES = 3;
 
 class CdpClient {
@@ -48,10 +48,18 @@ class CdpClient {
     let lastErr;
     for (let i = 0; i < MAX_RETRIES; i++) {
       try {
-        const result = await this._client.send(method, params);
+        // v1.14: Promise.race CDP 超时保护 (10s)
+        const result = await Promise.race([
+          this._client.send(method, params),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error(`CDP timeout: ${method}`)), CDP_TIMEOUT)
+          ),
+        ]);
         return result;
       } catch (err) {
         lastErr = err;
+        // v1.14: 永久错误不重试 (Target closed / Session detached)
+        if (err.message?.includes('Target closed') || err.message?.includes('Session')) break;
         this._log.warn({ method, attempt: i + 1, err: err.message }, 'CDP command retry');
         if (i < MAX_RETRIES - 1) {
           await new Promise(r => setTimeout(r, 500));
@@ -71,8 +79,8 @@ class CdpClient {
   /**
    * 注入鼠标事件。
    */
-  async dispatchMouse(type, x, y, button = 'left', deltaX = 0, deltaY = 0) {
-    const params = { type, x: Math.round(x), y: Math.round(y), button, clickCount: 1 };
+  async dispatchMouse(type, x, y, button = 'left', deltaX = 0, deltaY = 0, clickCount = 1) {
+    const params = { type, x: Math.round(x), y: Math.round(y), button, clickCount };
     if (type === 'mouseWheel') {
       params.deltaX = deltaX;
       params.deltaY = deltaY;

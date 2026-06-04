@@ -88,6 +88,7 @@ class HIDCapture {
 
   _send(type, payload) {
     payload.frame_id = this._getCurrentFrameId();
+    if (type >= 0x11 && type <= 0x12) { payload.timestamp = Date.now(); }  // v1.14: 双击检测时间戳
     this._onEvent(this._encode(type, payload));
   }
 

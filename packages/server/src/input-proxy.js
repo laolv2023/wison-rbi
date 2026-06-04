@@ -40,6 +40,11 @@ class InputProxy {
     this._maxTokens = Limits.HID_BURST_LIMIT;
     this._refillRate = Limits.HID_RATE_LIMIT_HZ; // tokens/s
     this._lastRefill = Date.now();
+
+    // v1.14: 双击检测状态 (clickCount 协议扩展)
+    this._lastClick = { time: 0, x: -1, y: -1, count: 0 };
+    this._DBLCLICK_WINDOW_MS = 500;
+    this._DBLCLICK_DIST_PX = 4;
   }
 
   /**
@@ -60,9 +65,21 @@ class InputProxy {
         case HIDType.MOUSE_MOVE:
           await this._cdp.dispatchMouse('mouseMoved', payload.x, payload.y);
           break;
-        case HIDType.MOUSE_DOWN:
-          await this._cdp.dispatchMouse('mousePressed', payload.x, payload.y, payload.button || 'left');
+        case HIDType.MOUSE_DOWN: {
+          // v1.14: 双击检测——客户端时间戳 + 位置容差
+          const now = payload.timestamp || Date.now();
+          const cx = Math.round(payload.x), cy = Math.round(payload.y);
+          let clickCount = 1;
+          if (now - this._lastClick.time < this._DBLCLICK_WINDOW_MS &&
+              Math.abs(cx - this._lastClick.x) < this._DBLCLICK_DIST_PX &&
+              Math.abs(cy - this._lastClick.y) < this._DBLCLICK_DIST_PX) {
+            clickCount = this._lastClick.count + 1;
+          }
+          this._lastClick = { time: now, x: cx, y: cy, count: clickCount };
+          await this._cdp.dispatchMouse('mousePressed',
+            cx, cy, payload.button || 'left', 0, 0, clickCount);
           break;
+        }
         case HIDType.MOUSE_UP:
           await this._cdp.dispatchMouse('mouseReleased', payload.x, payload.y, payload.button || 'left');
           break;

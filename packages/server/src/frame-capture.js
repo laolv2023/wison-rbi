@@ -64,6 +64,7 @@ class FrameCapture {
     const screenshotPng = await this._page.screenshot({
       type: 'png',
       fullPage: false,
+      timeout: 10000,  // v1.14: 10s 截图超时，防止渲染器冻结永久挂起
     });
 
     this._consecutiveFailures = 0;
@@ -89,6 +90,7 @@ class FrameCapture {
       // Keyframe: 整帧 JPEG（带宽优于 PNG）
       const screenshotJpeg = await this._page.screenshot({
         type: 'jpeg', quality: 70, fullPage: false,
+        timeout: 10000,  // v1.14
       });
       this._updateAllHashes(rawPixels, width, height);
       return {
@@ -105,13 +107,16 @@ class FrameCapture {
     // Diff: 从 PNG 裁剪脏 tile → JPEG 编码
     const tiles = [];
     for (const { x, y } of dirtyList) {
+      // v1.14: 边缘瓦片自适应尺寸，防止 sharp.extract 越界 (非16整除宽度)
+      const extractW = Math.min(this._tileSize, this._viewport.width - x);
+      const extractH = Math.min(this._tileSize, this._viewport.height - y);
       const tileBuf = await sharp(screenshotPng)
-        .extract({ left: x, top: y, width: this._tileSize, height: this._tileSize })
+        .extract({ left: x, top: y, width: extractW, height: extractH })
         .jpeg({ quality: 60 })
         .toBuffer();
       tiles.push({
         x, y,
-        w: this._tileSize, h: this._tileSize,
+        w: extractW, h: extractH,
         encoding: TileEncoding.JPEG,
         data: tileBuf,
       });
@@ -141,8 +146,8 @@ class FrameCapture {
       const tileX = col * this._tileSize;
       const tileY = row * this._tileSize;
 
-      // 提取 tile 区域的像素行
-      const tileBytes = Buffer.allocUnsafe(this._tileSize * this._tileSize * bytesPerPixel);
+      // v1.14: Buffer.alloc (零填充) 替代 allocUnsafe——边缘瓦片未填充区域不会混入随机数据影响哈希
+      const tileBytes = Buffer.alloc(this._tileSize * this._tileSize * bytesPerPixel);
       for (let py = 0; py < this._tileSize && (tileY + py) < imgHeight; py++) {
         const srcOff = ((tileY + py) * imgWidth + tileX) * bytesPerPixel;
         const dstOff = py * this._tileSize * bytesPerPixel;

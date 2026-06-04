@@ -88,7 +88,7 @@ class Session {
       this._page = await context.newPage();
 
       // 监听崩溃
-      this._page.on('crash', () => this._onChromiumCrash());
+      this._page.on('crash', () => { this._onChromiumCrash().catch(() => {}); });  // v1.14
 
       // CDP 连接
       this._cdp = new CdpClient(playwright, this._log);
@@ -174,7 +174,7 @@ class Session {
     this._running = false;
     if (this._frameLoop) clearInterval(this._frameLoop);
     if (this._cdp) await this._cdp.disconnect().catch(() => {});
-    if (this._browser) await this._browser.close().catch(() => {});
+    if (this._browser) { await Promise.race([this._browser.close(), new Promise(r => setTimeout(r, 5000))]).catch(() => {}); }  // v1.14: 5s 超时
     this._log.info({ duration: Date.now() - this._createdAt, frames: this._framesSent }, 'Session destroyed');
   }
 
@@ -263,6 +263,7 @@ class Session {
     if (++this._restartAttempts > 3) {
       this._log.error('Restart limit exceeded, destroying session');
       this._running = false;
+      if (this._frameLoop) { clearInterval(this._frameLoop); this._frameLoop = null; }  // v1.14
       this.destroy().catch(() => {});
       return;
     }
@@ -283,7 +284,7 @@ class Session {
         deviceScaleFactor: 1,
       });
       this._page = await context.newPage();
-      this._page.on('crash', () => this._onChromiumCrash());
+      this._page.on('crash', () => { this._onChromiumCrash().catch(() => {}); });  // v1.14
 
       this._cdp = new CdpClient(this._browser, this._log);
       await this._cdp.connect(this._page);
@@ -302,6 +303,7 @@ class Session {
       this._log.info('Chromium restarted');
     } catch (err) {
       this._log.error({ err }, 'Failed to restart Chromium');
+      this._browser = null; this._page = null; this._cdp = null;  // v1.14
     }
   }
 
