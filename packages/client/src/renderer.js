@@ -50,6 +50,11 @@ class Renderer {
     this._currentFrameId = 0;
     this._frameCount = 0;
 
+    // v2.1: 滚动优化状态
+    this._scrollX = 0;
+    this._scrollY = 0;
+    this._scrollOptimizeThreshold = 4;  // 最小优化滚动量 (px)
+
     this._initSurface();
   }
 
@@ -146,31 +151,113 @@ class Renderer {
     }
   }
 
-  // ── 瓦片渲染 ──────────────────────────────────────────
+  // ── 瓦片渲染 (v2.1: 滚动优化) ─────────────────────────
 
   _renderTiles(decoded) {
-    const { tiles, tileCount } = decoded;
+    const { tiles, tileCount, scrollX, scrollY } = decoded;
+
     if (tileCount === 0) return;
 
     // Keyframe: 单瓦片全画布
     if (tileCount === 1 && tiles[0].w === decoded.viewportW) {
-      const raw = new Uint8Array(decoded.data, tiles[0].dataOffset, tiles[0].dataLen);
-      const img = this._ck.MakeImageFromEncoded(raw);
-      if (img) {
-        this._skCanvas.drawImage(img, 0, 0);
-        img.delete();
-      }
+      this._scrollX = scrollX;
+      this._scrollY = scrollY;
+      this._drawKeyframe(decoded);
       return;
     }
 
-    // Diff: 逐瓦片绘制
+    // 计算滚动增量
+    const dx = scrollX - this._scrollX;
+    const dy = scrollY - this._scrollY;
+
+    // v2.1: 滚动优化——平移整个画布内容，再覆盖新边缘瓦片
+    if (Math.abs(dx) >= this._scrollOptimizeThreshold ||
+        Math.abs(dy) >= this._scrollOptimizeThreshold) {
+      this._renderScrollOptimized(decoded, dx, dy);
+    } else {
+      // 微小增量或首次帧：直接逐瓦片渲染
+      this._renderDirect(decoded);
+    }
+
+    this._scrollX = scrollX;
+    this._scrollY = scrollY;
+  }
+
+  /**
+   * v2.1: 滚动优化渲染
+   *
+   * 原理: 快照当前画布 → 平移快照到新位置 → 在新暴露区域绘制增量瓦片
+   * 开销: WebGL makeImageSnapshot ~1-3ms, 软件 ~0.1ms
+   * 降级: 快照失败 → 回退到 _renderDirect
+   */
+  _renderScrollOptimized(decoded, dx, dy) {
+    const { tiles, tileCount } = decoded;
+    const c = this._skCanvas;
+    const ck = this._ck;
+
+    // Step 1: 快照当前画布
+    const snapshot = this._surface.makeImageSnapshot();
+    if (!snapshot) {
+      this._renderDirect(decoded);
+      return;
+    }
+
+    // Step 2: 清空画布
+    c.clear(ck.TRANSPARENT);
+
+    // Step 3: 平移快照 (注意: 平移方向与服务端滚动方向相反)
+    // 服务端 scrollY += 16 → 内容上移 → 客户端 translate(0, -16)
+    c.save();
+    c.translate(-dx, -dy);
+    c.drawImage(snapshot, 0, 0);
+    c.restore();
+
+    // Step 4: 在新暴露区域叠加新瓦片
     for (const tile of tiles) {
       const raw = new Uint8Array(decoded.data, tile.dataOffset, tile.dataLen);
-      const img = this._ck.MakeImageFromEncoded(raw);
+      const img = ck.MakeImageFromEncoded(raw);
       if (img) {
-        this._skCanvas.drawImage(img, tile.x, tile.y);
+        c.drawImage(img, tile.x, tile.y);
         img.delete();
       }
+    }
+
+    // Step 5: 释放快照
+    snapshot.delete();
+  }
+
+  /**
+   * v2.1: 直接渲染 (无滚动或微小滚动)
+   */
+  _renderDirect(decoded) {
+    const { tiles, tileCount } = decoded;
+    const c = this._skCanvas;
+    const ck = this._ck;
+
+    for (const tile of tiles) {
+      const raw = new Uint8Array(decoded.data, tile.dataOffset, tile.dataLen);
+      const img = ck.MakeImageFromEncoded(raw);
+      if (img) {
+        c.drawImage(img, tile.x, tile.y);
+        img.delete();
+      }
+    }
+  }
+
+  /**
+   * v2.1: 关键帧渲染 (清空画布 + 全幅绘制)
+   */
+  _drawKeyframe(decoded) {
+    const { tiles } = decoded;
+    const c = this._skCanvas;
+    const ck = this._ck;
+
+    const raw = new Uint8Array(decoded.data, tiles[0].dataOffset, tiles[0].dataLen);
+    const img = ck.MakeImageFromEncoded(raw);
+    if (img) {
+      c.clear(ck.TRANSPARENT);
+      c.drawImage(img, 0, 0);
+      img.delete();
     }
   }
 
